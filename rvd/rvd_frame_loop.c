@@ -30,10 +30,14 @@ static void publish_utc_mapping(rvd_state_t *st, rss_ring_t *ring)
 {
 	int64_t media_a = 0, media_b = 0;
 
-	if (RSS_HAL_CALL(st->ops, sys_get_timestamp, st->hal_ctx, &media_a) != RSS_OK)
+	if (st->v4l2_backend)
+		media_a = rss_timestamp_us();
+	else if (RSS_HAL_CALL(st->ops, sys_get_timestamp, st->hal_ctx, &media_a) != RSS_OK)
 		return;
 	int64_t wall = rss_wallclock_us();
-	if (RSS_HAL_CALL(st->ops, sys_get_timestamp, st->hal_ctx, &media_b) != RSS_OK)
+	if (st->v4l2_backend)
+		media_b = rss_timestamp_us();
+	else if (RSS_HAL_CALL(st->ops, sys_get_timestamp, st->hal_ctx, &media_b) != RSS_OK)
 		return;
 	if (media_b - media_a > 1000)
 		return; /* preempted mid-sample, retry next interval */
@@ -81,7 +85,8 @@ void *rvd_encoder_thread(void *arg)
 	 * each configured frame. Skipped at near-continuous rates
 	 * where start/stop churn would exceed the savings.
 	 */
-	const rss_hal_caps_t *caps = st->ops->get_caps ? st->ops->get_caps(st->hal_ctx) : NULL;
+	const rss_hal_caps_t *caps = !st->v4l2_backend && st->ops->get_caps
+				       ? st->ops->get_caps(st->hal_ctx) : NULL;
 	int64_t pulse_interval_us = 0;
 	bool pulse =
 		s->is_jpeg && s->jpeg_idle && caps && caps->jpeg_pulse && s->enc_cfg.fps_num > 0;
@@ -147,12 +152,18 @@ void *rvd_encoder_thread(void *arg)
 		}
 
 		/* Check for consumer IDR request (set via ring header flag) */
-		if (s->ring && rss_ring_check_idr(s->ring))
-			RSS_HAL_CALL(st->ops, enc_request_idr, st->hal_ctx, s->chn);
+		if (s->ring && rss_ring_check_idr(s->ring)) {
+			if (st->v4l2_backend)
+				rss_v4l2_h264_request_idr(st->v4l2);
+			else
+				RSS_HAL_CALL(st->ops, enc_request_idr, st->hal_ctx, s->chn);
+		}
 
 		/* Block until encoder has a frame (up to 1 second timeout).
 		 * Each thread blocks independently so channels don't starve. */
-		int ret = RSS_HAL_CALL(st->ops, enc_poll, st->hal_ctx, s->chn, 1000);
+		int ret = st->v4l2_backend
+				  ? rss_v4l2_h264_poll(st->v4l2, 1000)
+				  : RSS_HAL_CALL(st->ops, enc_poll, st->hal_ctx, s->chn, 1000);
 		if (ret != RSS_OK) {
 			/* Timeouts are normal (sensor idle, JPEG on-demand stopped).
 			 * Log on repeated failures to catch flaky sensor/encoder. */
@@ -164,7 +175,9 @@ void *rvd_encoder_thread(void *arg)
 		poll_errors = 0;
 
 		rss_frame_t frame;
-		ret = RSS_HAL_CALL(st->ops, enc_get_frame, st->hal_ctx, s->chn, &frame);
+		ret = st->v4l2_backend
+			      ? rss_v4l2_h264_get_frame(st->v4l2, &frame)
+			      : RSS_HAL_CALL(st->ops, enc_get_frame, st->hal_ctx, s->chn, &frame);
 		if (ret == -EAGAIN)
 			continue; /* no frame this time (empty stream / JPEG fps divider) */
 		if (ret != RSS_OK) {
@@ -265,7 +278,10 @@ void *rvd_encoder_thread(void *arg)
 					     primary_nal_type(&frame), frame.is_key ? 1 : 0);
 		}
 
-		RSS_HAL_CALL(st->ops, enc_release_frame, st->hal_ctx, s->chn, &frame);
+		if (st->v4l2_backend)
+			rss_v4l2_h264_release_frame(st->v4l2, &frame);
+		else
+			RSS_HAL_CALL(st->ops, enc_release_frame, st->hal_ctx, s->chn, &frame);
 
 		frame_count++;
 

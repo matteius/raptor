@@ -66,6 +66,10 @@ struct rvd_state {
 	/* HAL */
 	rss_hal_ctx_t *hal_ctx;
 	const rss_hal_ops_t *ops;
+	bool hal_initialized;
+	bool v4l2_backend;
+	char v4l2_device[64];
+	rss_v4l2_h264_t *v4l2;
 
 	/* Sensors */
 	int sensor_count;
