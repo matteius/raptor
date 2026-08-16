@@ -78,6 +78,7 @@ void *rvd_encoder_thread(void *arg)
 	int64_t last_stats = rss_timestamp_us();
 	int64_t last_reap = last_stats;
 	int64_t last_utc = 0; /* 0 = publish on first frame */
+	bool startup_delta_applied = false;
 
 	/*
 	 * Old-SDK JPEG duty-cycling: a continuously receiving JPEG
@@ -185,6 +186,20 @@ void *rvd_encoder_thread(void *arg)
 			continue;
 		}
 		poll_errors = 0;
+
+		/* The T31 codec completes part of its lazy hardware setup during the
+		 * first successful poll.  Reapply the configured I/P delta once after
+		 * that boundary so later periodic and join-requested IDRs retain it. */
+		if (!startup_delta_applied && !st->v4l2_backend && !s->is_jpeg &&
+		    s->enc_cfg.ip_delta >= 0) {
+			int delta_ret = RSS_HAL_CALL(st->ops, enc_set_qp_ip_delta,
+						     st->hal_ctx, s->chn,
+						     s->enc_cfg.ip_delta);
+			if (delta_ret != RSS_OK)
+				RSS_WARN("stream%d: post-poll I/P QP delta %d failed: %d", idx,
+					 s->enc_cfg.ip_delta, delta_ret);
+			startup_delta_applied = true;
+		}
 
 		rss_frame_t frame;
 		if (st->v4l2_backend)
