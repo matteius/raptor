@@ -6,16 +6,57 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <netinet/in.h>
 #include <rss_net.h>
 #include <rss_aac.h>
 
 #include "rsd.h"
+
+/* Mark outbound UDP video RTP for QoS when [rtsp] rtp_dscp is configured.
+ * DSCP is shifted into the IPv4 TOS / IPv6 traffic-class field; SO_PRIORITY
+ * gives Linux wireless/qdisc code the matching 802.1D user priority even on
+ * paths that later bleach DSCP.  RTCP, audio, and backchannel sockets retain
+ * their default treatment. */
+static void rsd_configure_video_rtp_qos(rsd_client_t *client, int fd, int family)
+{
+	int dscp = rss_config_get_int(client->srv->cfg, "rtsp", "rtp_dscp", 0);
+	if (dscp <= 0)
+		return;
+	if (dscp > 63) {
+		RSS_WARN("rtsp.rtp_dscp=%d is outside 0..63; leaving UDP video unmarked", dscp);
+		return;
+	}
+
+	int traffic_class = dscp << 2;
+	bool marked = false;
+	if (family == AF_INET6 &&
+	    setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &traffic_class,
+		       sizeof(traffic_class)) == 0)
+		marked = true;
+	/* A dual-stack RTSP listener reports IPv4 clients as AF_INET6 mapped
+	 * peers, but their connected datagram socket still emits IPv4 packets.
+	 * Set IP_TOS on AF_INET6 sockets too so both native and mapped paths are
+	 * covered; failure is harmless when the socket is native IPv6. */
+	if ((family == AF_INET || family == AF_INET6) &&
+	    setsockopt(fd, IPPROTO_IP, IP_TOS, &traffic_class, sizeof(traffic_class)) == 0)
+		marked = true;
+	if (!marked)
+		RSS_WARN("failed to set video RTP DSCP %d: %s", dscp, strerror(errno));
+
+	int priority = dscp >> 3;
+	if (setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority)) != 0)
+		RSS_WARN("failed to set video RTP socket priority %d: %s", priority,
+			 strerror(errno));
+	else
+		RSS_DEBUG("video RTP QoS: DSCP=%d socket_priority=%d", dscp, priority);
+}
 
 /* Base64 encode for sprop-parameter-sets */
 static int b64_encode(const uint8_t *src, int len, char *dst, int dst_size)
@@ -768,6 +809,8 @@ static void rsd_client_t_setup(VSelf, Compy_Context *ctx, const Compy_Request *r
 			compy_respond_internal_error(ctx);
 			return;
 		}
+		if (!is_audio && !is_backchannel)
+			rsd_configure_video_rtp_qos(self, *rtp_fd, sa->sa_family);
 
 		rtp_t = compy_transport_udp(*rtp_fd);
 		rtcp_t = compy_transport_udp(*rtcp_fd);
