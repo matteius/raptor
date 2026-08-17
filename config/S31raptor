@@ -100,13 +100,8 @@ start() {
 	fi
 
 	# Audio: preload libimp-nodbg if available to avoid competing IMP debug thread
-	# OpenIMP is video-only.  RAD needs the matching Ingenic audio IMP
-	# library in a process-local search path, without replacing RVD's libimp.
 	RAD_ENV=""
-	[ -f /opt/ingenic-audio/libimp.so ] && \
-		RAD_ENV="LD_LIBRARY_PATH=/opt/ingenic-audio:/usr/lib"
-	[ -f /usr/lib/libimp-nodbg.so ] && \
-		RAD_ENV="${RAD_ENV:+$RAD_ENV }LD_PRELOAD=/usr/lib/libimp-nodbg.so"
+	[ -f /usr/lib/libimp-nodbg.so ] && RAD_ENV="LD_PRELOAD=/usr/lib/libimp-nodbg.so"
 	start_daemon rad $RAD_ENV
 
 	# Core daemons
