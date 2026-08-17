@@ -25,6 +25,9 @@
 #include "rwd.h"
 #include "../rsd/rsd_media_clock.h"
 
+/* Defined below the send helpers; spawned by rwd_media_setup. */
+static void *rwd_client_send_thread(void *arg);
+
 /* ── sendto-based UDP transport (Compy_Transport interface) ──
  *
  * Unlike compy's connected UDP transport, this uses sendto() with
@@ -347,6 +350,18 @@ int rwd_media_setup(rwd_client_t *c)
 #endif
 	}
 
+	/* The send thread pays the packetize/SRTP cost so the ring reader
+	 * never overstays the refmode copy budget. Runs under
+	 * clients_lock (our caller), so the reader can't observe
+	 * sending=true before the queue exists. */
+	rwd_sendq_init(&c->sendq);
+	if (pthread_create(&c->send_thread, NULL, rwd_client_send_thread, c) != 0) {
+		RSS_ERROR("media: send thread failed for %s", c->session_id);
+		rwd_sendq_destroy(&c->sendq);
+		return -1;
+	}
+	c->send_thread_started = true;
+
 	c->media_ready = true;
 	c->sending = true;
 	c->waiting_keyframe = true;
@@ -369,6 +384,17 @@ void rwd_media_teardown(rwd_client_t *c)
 {
 	c->sending = false;
 	c->media_ready = false;
+
+	/* Stop the send thread before dropping the transports it sends
+	 * through: shutdown wakes its pop, the join bounds on the
+	 * in-flight frame. It never takes clients_lock, so joining under
+	 * it (all teardown call sites) cannot deadlock. */
+	if (c->send_thread_started) {
+		rwd_sendq_shutdown(&c->sendq);
+		pthread_join(c->send_thread, NULL);
+		c->send_thread_started = false;
+		rwd_sendq_destroy(&c->sendq);
+	}
 
 	/* Drop order matters:
 	 * 1. RTCP first (borrows RTP transport, owns SRTCP transport)
@@ -592,6 +618,27 @@ static void rwd_send_audio_frame(rwd_client_t *c, const uint8_t *data, uint32_t 
 	}
 }
 
+/* Per-client video send thread — drains the sendq through compy
+ * (packetize + SRTP + socket). Touches only its own client, never
+ * clients_lock; teardown shuts the queue and joins before dropping
+ * the transports this uses. */
+static void *rwd_client_send_thread(void *arg)
+{
+	rwd_client_t *c = arg;
+	rwd_sendq_entry_t e;
+
+	while (rwd_sendq_pop(&c->sendq, &e)) {
+		if (c->sending &&
+		    rwd_send_video_frame(c, e.data, e.len, e.rtp_ts, e.capture_us) < 0) {
+			rwd_sendq_fail(&c->sendq);
+			RSS_WARN("media: client[%s] UDP send stalled: waiting for keyframe",
+				 c->session_id);
+		}
+		free(e.data);
+	}
+	return NULL;
+}
+
 /* ── Video reader thread ──
  *
  * Reads from both main (stream 0) and sub (stream 1) rings,
@@ -800,6 +847,24 @@ void *rwd_video_reader_thread(void *arg)
 				pthread_mutex_unlock(&srv->clients_lock);
 				continue;
 			}
+			if (ret == -ENOSPC) {
+				/* The frame outgrew the buffer sized at ring open —
+				 * an encoder restart (set-resolution) can raise the
+				 * per-buffer stride mid-life. The read reported the
+				 * needed size and already advanced past the frame;
+				 * grow and continue so it stays a one-frame hiccup,
+				 * not a permanent skip storm. */
+				uint8_t *bigger = realloc(srv->video_bufs[s], length);
+				if (bigger) {
+					RSS_WARN("media: video[%d] frame buffer %u -> %u after "
+						 "producer restart",
+						 s, srv->video_buf_sizes[s], length);
+					srv->video_bufs[s] = bigger;
+					srv->video_buf_sizes[s] = length;
+				}
+				srv->video_read_seq[s] = read_seq;
+				continue;
+			}
 			if (ret != 0)
 				continue;
 
@@ -833,12 +898,16 @@ void *rwd_video_reader_thread(void *arg)
 				}
 
 				uint32_t client_ts = rtp_ts - c->video_ts_offset;
-				if (rwd_send_video_frame(c, srv->video_bufs[s], length, client_ts,
-							 capture_mono_us) < 0) {
+				if (!c->send_thread_started)
+					continue;
+				if (rwd_sendq_push(&c->sendq, srv->video_bufs[s], length,
+						   client_ts, capture_mono_us, meta.is_key) != 0) {
+					/* Queue full: this client can't drain at
+					 * stream rate, or its last access unit failed.
+					 * Everything queued was purged; resume clean
+					 * at the next keyframe. */
 					c->waiting_keyframe = true;
 					rwd_request_idr(srv, s);
-					RSS_WARN("media: client[%d] UDP send stalled: waiting for keyframe",
-						 s);
 				}
 			}
 			pthread_mutex_unlock(&srv->clients_lock);
