@@ -22,6 +22,7 @@
 #endif
 
 #include "rwd.h"
+#include "../rsd/rsd_media_clock.h"
 
 /* ── sendto-based UDP transport (Compy_Transport interface) ──
  *
@@ -421,7 +422,7 @@ static const uint8_t *find_nalu_end(const uint8_t *nalu_start, const uint8_t *en
 /* ── Parse Annex B and send NALUs via SRTP ── */
 
 static void rwd_send_video_frame(rwd_client_t *c, const uint8_t *data, uint32_t len,
-				 uint32_t rtp_ts)
+				 uint32_t rtp_ts, int64_t capture_us)
 {
 	if (!c->nal_video || !c->sending)
 		return;
@@ -496,6 +497,11 @@ static void rwd_send_video_frame(rwd_client_t *c, const uint8_t *data, uint32_t 
 		p = nalu_end;
 	}
 
+	/* Pair the wire timestamp with the frame's capture instant before an
+	 * RTCP sender report projects it to now. Using the network send time here
+	 * makes queue/Wi-Fi latency appear as a clock correction at the browser. */
+	Compy_RtpTransport_set_clock_reference(c->rtp_video, rtp_ts, (uint64_t)capture_us);
+
 	/* Periodic RTCP SR (every 5 seconds) */
 	if (c->rtcp_video) {
 		int64_t now = rss_timestamp_us();
@@ -538,6 +544,10 @@ void *rwd_video_reader_thread(void *arg)
 {
 	rwd_server_t *srv = arg;
 	int64_t video_ts_epoch[RWD_STREAM_COUNT] = {0};
+	rsd_media_clock_t video_clock[RWD_STREAM_COUNT];
+	bool stream_active[RWD_STREAM_COUNT] = {false};
+	for (int s = 0; s < RWD_STREAM_COUNT; s++)
+		rsd_media_clock_init(&video_clock[s]);
 
 	/* Wait for at least the main ring */
 	while (rss_running(srv->running) && !srv->video_rings[0]) {
@@ -611,6 +621,7 @@ void *rwd_video_reader_thread(void *arg)
 					last_ws[s] = 0;
 					idle[s] = 0;
 					video_ts_epoch[s] = 0;
+					rsd_media_clock_init(&video_clock[s]);
 
 					/* Detect codec change — disconnect clients
 					 * if codec switched (WebRTC can't renegotiate
@@ -655,8 +666,14 @@ void *rwd_video_reader_thread(void *arg)
 				}
 			}
 			pthread_mutex_unlock(&srv->clients_lock);
-			if (!has_clients)
+			if (!has_clients) {
+				stream_active[s] = false;
 				continue;
+			}
+			if (!stream_active[s]) {
+				rsd_media_clock_init(&video_clock[s]);
+				stream_active[s] = true;
+			}
 
 			any_polled = true;
 			int ret = rss_ring_wait(srv->video_rings[s], 50);
@@ -719,6 +736,8 @@ void *rwd_video_reader_thread(void *arg)
 				continue;
 
 			srv->video_read_seq[s] = read_seq;
+			int64_t capture_mono_us = rsd_media_clock_map(
+				&video_clock[s], (int64_t)meta.timestamp, rss_timestamp_us());
 
 			if (video_ts_epoch[s] == 0)
 				video_ts_epoch[s] = meta.timestamp;
@@ -746,7 +765,8 @@ void *rwd_video_reader_thread(void *arg)
 				}
 
 				uint32_t client_ts = rtp_ts - c->video_ts_offset;
-				rwd_send_video_frame(c, srv->video_bufs[s], length, client_ts);
+				rwd_send_video_frame(c, srv->video_bufs[s], length, client_ts,
+						     capture_mono_us);
 			}
 			pthread_mutex_unlock(&srv->clients_lock);
 		}
