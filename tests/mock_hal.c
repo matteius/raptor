@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <errno.h>
@@ -74,6 +75,10 @@ static const uint8_t h265_p_sc[] = {0x00, 0x00, 0x00, 0x01, 0x02, 0x01};
 
 typedef struct {
 	bool active;
+	/* Set from the ctrl thread, consumed by the encoder thread: the
+	 * two never synchronise, so a plain bool is a data race (TSan
+	 * caught it the first time the suite ran a real tsan build). */
+	_Atomic bool force_idr;
 	uint32_t frame_seq;
 	uint8_t buf_idx;
 
@@ -136,6 +141,21 @@ static int mock_ok(void *ctx, ...)
 	return RSS_OK;
 }
 
+/*
+ * Named, not folded into mock_ok: the jpeg IDR gate in rvd is
+ * unobservable on real hardware (skipping a call that was a no-op
+ * there), so this trace line is the only artifact a regression test
+ * can assert on.
+ */
+static int mock_enc_request_idr(void *ctx, int chn)
+{
+	rss_hal_ctx_t *hal = ctx;
+	if (hal && chn >= 0 && chn < MOCK_MAX_CHANNELS)
+		atomic_store(&hal->channels[chn].force_idr, true);
+	fprintf(stderr, "mock: enc_request_idr chn=%d\n", chn);
+	return RSS_OK;
+}
+
 static void *mock_null_ptr(void *ctx, ...)
 {
 	(void)ctx;
@@ -195,6 +215,28 @@ static int mock_enc_poll(void *ctx, int chn, uint32_t timeout_ms)
 	return RSS_OK;
 }
 
+static int mock_fs_snap_frame(void *ctx, int chn, void **frame_data, rss_frame_info_t *info)
+{
+	(void)ctx;
+	(void)chn;
+	if (!frame_data || !info || info->width == 0 || info->height == 0)
+		return -EINVAL;
+	uint32_t size = (uint32_t)info->width * info->height * 3 / 2;
+	uint8_t *buf = malloc(size);
+	if (!buf)
+		return -ENOMEM;
+	/* luma gradient + neutral chroma — decodable, visually obvious */
+	uint32_t luma = (uint32_t)info->width * info->height;
+	for (uint32_t i = 0; i < luma; i++)
+		buf[i] = (uint8_t)(i % 251);
+	memset(buf + luma, 128, size - luma);
+	info->pixfmt = RSS_PIXFMT_NV12;
+	info->size = size;
+	info->timestamp = 0;
+	*frame_data = buf;
+	return RSS_OK;
+}
+
 static int mock_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
 {
 	rss_hal_ctx_t *hal = ctx;
@@ -206,7 +248,7 @@ static int mock_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
 		return -EAGAIN;
 
 	uint32_t gop = ch->cfg.gop_length ? ch->cfg.gop_length : 50;
-	bool is_key = (ch->frame_seq % gop == 0);
+	bool is_key = (ch->frame_seq % gop == 0) || atomic_exchange(&ch->force_idr, false);
 	bool is_jpeg = (ch->cfg.codec == RSS_CODEC_JPEG || ch->cfg.codec == RSS_CODEC_MJPEG);
 
 	uint8_t *dest;
@@ -557,6 +599,48 @@ static int mock_isp_get_wb(void *ctx, rss_wb_config_t *wb_cfg)
 	return RSS_OK;
 }
 
+/*
+ * Sensor rate, and the two knobs that let a test choose which platform
+ * this mock imitates. Defaults reproduce a settable sensor with no
+ * read-back, so a suite that sets neither sees the behavior it always saw.
+ *
+ * RSS_MOCK_SENSOR_FPS_SET=notsup   the setter refuses as unsupported, as a
+ *                                  SoC whose rate is fixed at bring-up does
+ * RSS_MOCK_SENSOR_FPS_SET=error    the setter fails outright, which is a
+ *                                  fault and must still be reported as one
+ * RSS_MOCK_SENSOR_FPS_ACTUAL=<n>   the getter reports n fps; absent, it
+ *                                  refuses too, as a backend with no
+ *                                  read-back does
+ */
+static int mock_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
+{
+	(void)ctx;
+	(void)fps_num;
+	(void)fps_den;
+	const char *mode = getenv("RSS_MOCK_SENSOR_FPS_SET");
+
+	if (mode && strcmp(mode, "notsup") == 0)
+		return RSS_ERR_NOTSUP;
+	if (mode && strcmp(mode, "error") == 0)
+		return RSS_ERR;
+	return RSS_OK;
+}
+
+static int mock_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den)
+{
+	(void)ctx;
+	const char *v = getenv("RSS_MOCK_SENSOR_FPS_ACTUAL");
+	int actual = v ? atoi(v) : 0;
+
+	if (actual <= 0)
+		return RSS_ERR_NOTSUP;
+	if (!fps_num || !fps_den)
+		return RSS_ERR_INVAL;
+	*fps_num = (uint32_t)actual;
+	*fps_den = 1;
+	return RSS_OK;
+}
+
 /* ── Audio ── */
 
 static int mock_audio_init(void *ctx, const rss_audio_config_t *cfg)
@@ -645,6 +729,7 @@ static const rss_hal_ops_t mock_ops = {
 	.fs_enable_channel = (void *)mock_ok,
 	.fs_disable_channel = (void *)mock_ok,
 	.fs_set_fifo = (void *)mock_ok,
+	.fs_snap_frame = mock_fs_snap_frame,
 	.fs_set_frame_depth = (void *)mock_ok,
 
 	/* Encoder */
@@ -659,7 +744,7 @@ static const rss_hal_ops_t mock_ops = {
 	.enc_poll = mock_enc_poll,
 	.enc_get_frame = mock_enc_get_frame,
 	.enc_release_frame = (void *)mock_ok,
-	.enc_request_idr = (void *)mock_ok,
+	.enc_request_idr = mock_enc_request_idr,
 	.enc_inject_stream_shm = mock_enc_inject_stream_shm,
 	.enc_get_rmem_info = mock_enc_get_rmem_info,
 	.enc_set_rc_mode = (void *)mock_ok,
@@ -727,7 +812,7 @@ static const rss_hal_ops_t mock_ops = {
 	.isp_set_hflip = (void *)mock_ok,
 	.isp_set_vflip = (void *)mock_ok,
 	.isp_set_running_mode = (void *)mock_ok,
-	.isp_set_sensor_fps = (void *)mock_ok,
+	.isp_set_sensor_fps = mock_isp_set_sensor_fps,
 	.isp_set_antiflicker = (void *)mock_ok,
 	.isp_set_bypass = (void *)mock_ok,
 	.isp_set_sinter_strength = (void *)mock_ok,
@@ -754,6 +839,7 @@ static const rss_hal_ops_t mock_ops = {
 	.isp_get_ae_comp = mock_isp_get_ae_comp,
 	.isp_get_max_again = (void *)mock_isp_get_u32,
 	.isp_get_max_dgain = (void *)mock_isp_get_u32,
+	.isp_get_sensor_fps = mock_isp_get_sensor_fps,
 	.isp_get_sinter_strength = (void *)mock_isp_get_u8,
 	.isp_get_temper_strength = (void *)mock_isp_get_u8,
 	.isp_get_dpc_strength = (void *)mock_isp_get_u8,
@@ -825,6 +911,7 @@ static const rss_hal_ops_t mock_ops = {
 	.ao_pause = (void *)mock_ok,
 	.ao_resume = (void *)mock_ok,
 	.ao_clear_buf = (void *)mock_ok,
+	.ao_flush_buf = (void *)mock_ok,
 
 	/* Audio encoding */
 	.aenc_create_channel = (void *)mock_ok,

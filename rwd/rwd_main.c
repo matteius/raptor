@@ -22,6 +22,8 @@
 #include <sys/epoll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 #include <mbedtls/md.h>
 
@@ -58,6 +60,69 @@ int rwd_random_bytes(uint8_t *buf, size_t len)
 		return -1;
 	ssize_t n = read(urandom_fd, buf, len);
 	return n == (ssize_t)len ? 0 : -1;
+}
+
+/* Usable as an SDP connection address: not loopback, and not an address a
+ * peer cannot route to. IPv6 link-local is excluded because it is meaningless
+ * in SDP without a scope identifier (RFC 4007). */
+static int addr_is_usable(const struct sockaddr *sa)
+{
+	if (sa->sa_family == AF_INET) {
+		uint32_t v4 = ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
+		if ((v4 >> 24) == 127)			/* 127.0.0.0/8   loopback */
+			return 0;
+		if ((v4 & 0xffff0000u) == 0xa9fe0000u)	/* 169.254.0.0/16 link-local */
+			return 0;
+		return 1;
+	}
+	if (sa->sa_family == AF_INET6) {
+		const struct in6_addr *a6 = &((const struct sockaddr_in6 *)sa)->sin6_addr;
+		if (IN6_IS_ADDR_LOOPBACK(a6) || IN6_IS_ADDR_LINKLOCAL(a6) ||
+		    IN6_IS_ADDR_SITELOCAL(a6) || IN6_IS_ADDR_UNSPECIFIED(a6))
+			return 0;
+		return 1;
+	}
+	return 0;
+}
+
+/* First usable address of the requested family on a carrier-up, non-loopback
+ * interface. IFF_RUNNING rather than IFF_UP: an administratively up interface
+ * with no carrier has no reachable address. */
+static int local_ip_from_ifaddrs(int family, char *buf, size_t buflen)
+{
+	struct ifaddrs *list = NULL;
+	struct ifaddrs *ifa;
+	int rc = -1;
+
+	if (getifaddrs(&list) != 0)
+		return -1;
+
+	for (ifa = list; ifa; ifa = ifa->ifa_next) {
+		const void *src;
+
+		if (!ifa->ifa_addr)
+			continue;
+		if (ifa->ifa_addr->sa_family != family)
+			continue;
+		if (ifa->ifa_flags & IFF_LOOPBACK)
+			continue;
+		if ((ifa->ifa_flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING))
+			continue;
+		if (!addr_is_usable(ifa->ifa_addr))
+			continue;
+
+		src = (family == AF_INET6)
+			      ? (const void *)&((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr
+			      : (const void *)&((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+		if (!inet_ntop(family, src, buf, buflen))
+			continue;
+
+		rc = 0;
+		break;
+	}
+
+	freeifaddrs(list);
+	return rc;
 }
 
 /* ── Utility: auto-detect local IP address ── */
@@ -102,6 +167,24 @@ int rwd_get_local_ip(char *buf, size_t buflen)
 		close(fd);
 	}
 
+	/*
+	 * Both probes above need a route off the box. A camera serving its own
+	 * access point during provisioning has only a link-local route and no
+	 * gateway, so both connect() calls fail with ENETUNREACH and the SDP
+	 * would otherwise carry an empty address: "c=IN IP4 " and a candidate
+	 * line missing its address. Signalling completes and no media flows.
+	 *
+	 * Fall back to the first usable address on an up, non-loopback
+	 * interface. IPv6 is tried first to match the probes above and the
+	 * preference set in b920eb3; the media socket is dual-stack
+	 * (IPV6_V6ONLY off) and the SDP writer selects IP4/IP6 per address, so
+	 * either family is answerable.
+	 */
+	if (local_ip_from_ifaddrs(AF_INET6, buf, buflen) == 0)
+		return 0;
+	if (local_ip_from_ifaddrs(AF_INET, buf, buflen) == 0)
+		return 0;
+
 	return -1;
 }
 
@@ -141,40 +224,20 @@ void rwd_generate_ice_credentials(char *ufrag, size_t ufrag_len, char *pwd, size
 
 static int create_udp_socket(int port)
 {
-	int fd = socket(AF_INET6, SOCK_DGRAM, 0);
-	if (fd < 0) {
-		/* Fallback to IPv4 if IPv6 not available */
-		fd = socket(AF_INET, SOCK_DGRAM, 0);
-		if (fd < 0)
-			return -1;
-
-		int reuse = 1;
-		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-		struct sockaddr_in addr = {
-			.sin_family = AF_INET,
-			.sin_port = htons(port),
-			.sin_addr.s_addr = INADDR_ANY,
-		};
-		if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-			close(fd);
-			return -1;
-		}
-		fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-		return fd;
-	}
+	int family = AF_INET6;
+	int fd = rss_socket_udp(&family);
+	if (fd < 0)
+		return -1;
+	if (family == AF_INET)
+		RSS_INFO("kernel has no IPv6; WebRTC media on IPv4 only");
 
 	int reuse = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-	int off = 0;
-	setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
 
-	struct sockaddr_in6 addr = {
-		.sin6_family = AF_INET6,
-		.sin6_port = htons(port),
-		.sin6_addr = IN6ADDR_ANY_INIT,
-	};
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+	struct sockaddr_storage addr;
+	socklen_t addrlen = rss_sockaddr_any(family, (uint16_t)port, &addr);
+
+	if (bind(fd, (struct sockaddr *)&addr, addrlen) < 0) {
 		close(fd);
 		return -1;
 	}
@@ -189,42 +252,22 @@ static int create_udp_socket(int port)
 
 static int create_http_socket(int port)
 {
-	int fd = socket(AF_INET6, SOCK_STREAM, 0);
-	if (fd >= 0) {
-		int reuse = 1;
-		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-		int off = 0;
-		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+	int family = AF_INET6;
+	int fd = rss_socket_tcp(&family);
+	if (fd < 0)
+		return -1;
+	if (family == AF_INET)
+		RSS_INFO("kernel has no IPv6; WebRTC signaling on IPv4 only");
 
-		struct sockaddr_in6 addr6 = {
-			.sin6_family = AF_INET6,
-			.sin6_port = htons(port),
-			.sin6_addr = IN6ADDR_ANY_INIT,
-		};
-		if (bind(fd, (struct sockaddr *)&addr6, sizeof(addr6)) < 0) {
-			close(fd);
-			fd = -1;
-		}
-	}
+	int reuse = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-	/* Fallback to IPv4 if IPv6 not available */
-	if (fd < 0) {
-		fd = socket(AF_INET, SOCK_STREAM, 0);
-		if (fd < 0)
-			return -1;
+	struct sockaddr_storage addr;
+	socklen_t addrlen = rss_sockaddr_any(family, (uint16_t)port, &addr);
 
-		int reuse = 1;
-		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-		struct sockaddr_in addr4 = {
-			.sin_family = AF_INET,
-			.sin_port = htons(port),
-			.sin_addr.s_addr = INADDR_ANY,
-		};
-		if (bind(fd, (struct sockaddr *)&addr4, sizeof(addr4)) < 0) {
-			close(fd);
-			return -1;
-		}
+	if (bind(fd, (struct sockaddr *)&addr, addrlen) < 0) {
+		close(fd);
+		return -1;
 	}
 
 	/* listen backlog of 8 provides implicit connection limiting */
@@ -241,7 +284,7 @@ static int create_http_socket(int port)
 
 /* Compare sockaddr by family-specific fields only (not padding bytes).
  * memcmp on sockaddr_storage can fail on uninitialized padding. */
-static bool sockaddr_equal(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
+bool rwd_sockaddr_equal(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
 {
 	if (a->ss_family != b->ss_family)
 		return false;
@@ -262,13 +305,32 @@ static bool sockaddr_equal(const struct sockaddr_storage *a, const struct sockad
 static rwd_client_t *find_client_by_addr(rwd_server_t *srv, const struct sockaddr_storage *addr,
 					 socklen_t addr_len)
 {
-	(void)addr_len;
 	for (int i = 0; i < RWD_MAX_CLIENTS; i++) {
 		rwd_client_t *c = srv->clients[i];
 		if (!c || !c->ice_verified)
 			continue;
-		if (sockaddr_equal(&c->addr, addr))
+		if (rwd_sockaddr_equal(&c->addr, addr))
 			return c;
+	}
+	/* Not the pinned address: accept any source this client has
+	 * proven via STUN integrity, and latch the media path there.
+	 * The client DTLS/media source is the nominated pair; the
+	 * pinned addr may have been re-set by a racing check from
+	 * another local candidate (seen as multi-second DTLS stalls
+	 * on jittery links when the ClientHello was dropped here). */
+	for (int i = 0; i < RWD_MAX_CLIENTS; i++) {
+		rwd_client_t *c = srv->clients[i];
+		if (!c || !c->ice_verified)
+			continue;
+		for (int j = 0; j < c->n_verified && j < RWD_MAX_VERIFIED_ADDRS; j++) {
+			if (rwd_sockaddr_equal(&c->verified_addrs[j], addr)) {
+				memcpy(&c->addr, addr, sizeof(*addr));
+				c->addr_len = addr_len;
+				RSS_INFO("ICE: client %s media path latched to verified source",
+					 c->session_id);
+				return c;
+			}
+		}
 	}
 	return NULL;
 }
@@ -797,6 +859,10 @@ int main(int argc, char **argv)
 			    sizeof(wt.stun_server));
 		wt.stun_port = rss_config_get_int(dctx.cfg, "webtorrent", "stun_port", 19302);
 		wt.tls_verify = rss_config_get_bool(dctx.cfg, "webtorrent", "tls_verify", true);
+		/* The hosted viewer page lives in the thingino/webtorrent-viewer
+		 * repo (it used to be rwd/share.html here); viewer_url only
+		 * matters for self-hosters. webrtc.html below is unrelated: that
+		 * is the on-camera LAN page. */
 		rss_strlcpy(wt.viewer_base_url,
 			    rss_config_get_str(dctx.cfg, "webtorrent", "viewer_url",
 					       "https://viewer.thingino.com/share.html"),

@@ -60,6 +60,83 @@ static uint8_t rvd_level_idc(int width, int height)
 	return 52; /* 5.2 */
 }
 
+/*
+ * Publish a stream's geometry and rate into its ring header.
+ *
+ * rsd builds the SDP from this header, so anything that changes a stream at
+ * runtime has to call it again -- otherwise the next client to connect is
+ * told the value the stream started with.
+ */
+void rvd_stream_publish_info(rvd_state_t *st, int idx)
+{
+	rvd_stream_t *s;
+
+	if (!st || idx < 0 || idx >= st->stream_count)
+		return;
+
+	s = &st->streams[idx];
+	if (!s->ring)
+		return;
+
+	if (s->is_jpeg) {
+		int jpeg_idx = 0;
+		for (int j = 0; j < st->jpeg_count; j++) {
+			if (st->jpeg_streams[j] == idx) {
+				jpeg_idx = j;
+				break;
+			}
+		}
+		rss_ring_set_stream_info(s->ring, RVD_JPEG_STREAM_ID_BASE + jpeg_idx,
+					 RSS_CODEC_JPEG, s->enc_cfg.width, s->enc_cfg.height,
+					 s->enc_cfg.fps_num, s->enc_cfg.fps_den, 0, 0);
+	} else {
+		/* A sensor-rate override reflects the ACTUAL rate into the ring
+		 * header; rsd already tracks in-place header rate changes for
+		 * a=framerate and pacing, so downstream follows automatically. */
+		uint32_t fn = s->active_fps_num ? s->active_fps_num : s->enc_cfg.fps_num;
+		uint32_t fd = s->active_fps_num ? s->active_fps_den : s->enc_cfg.fps_den;
+		rss_ring_set_stream_info(s->ring, idx, s->enc_cfg.codec, s->enc_cfg.width,
+					 s->enc_cfg.height, fn, fd,
+					 rvd_profile_idc(s->enc_cfg.profile),
+					 rvd_level_idc(s->enc_cfg.width, s->enc_cfg.height));
+	}
+}
+
+/*
+ * (Re-)declare the ring's reference-mode region from CURRENT encoder
+ * state. Runs at ring creation and again on every reuse across an
+ * encoder restart -- the restart replaces the backing region (new SHM
+ * injection, possibly a new stride), and each enable bumps the ring's
+ * ref generation so live consumers remap instead of reading frozen
+ * bytes from the old object under fresh slot metadata.
+ *
+ * Capacity stays declared at the tracking maximum, not the encoder's
+ * nominal buffer count: after RequestIDR+Flush the T41 encoder emits
+ * IDR AUs from a buffer beyond max_stream_cnt, and a buf_idx past the
+ * declared count makes publish_ref reject exactly the keyframes. The
+ * stride still describes the real per-buffer size.
+ */
+static void rvd_stream_enable_refmode(rvd_state_t *st, int idx)
+{
+	rvd_stream_t *s = &st->streams[idx];
+
+	if (!s->ring || s->is_jpeg || s->enc_cfg.codec == RSS_CODEC_JPEG || !st->refmode)
+		return;
+
+	if (st->refmode_shm && st->enc_shm_size[idx] > 0) {
+		uint8_t cnt = s->enc_cfg.max_stream_cnt;
+		if (!cnt)
+			cnt = 2;
+		rss_ring_enable_refmode(s->ring, st->enc_shm_size[idx], 0, RSS_RING_MAX_REF_BUFS,
+					st->enc_shm_size[idx] / cnt);
+	} else if (!st->refmode_shm && st->rmem_size > 0) {
+		uint32_t actual_stride = 0;
+		RSS_HAL_CALL(st->ops, enc_get_stream_buf_size, st->hal_ctx, s->chn, &actual_stride);
+		rss_ring_enable_refmode(s->ring, st->rmem_size, st->rmem_mmap_offset,
+					RSS_RING_MAX_REF_BUFS, actual_stride);
+	}
+}
+
 /* Parse codec string from config */
 static rss_codec_t parse_codec(const char *s)
 {
@@ -128,9 +205,8 @@ static const char *rc_mode_str(rss_rc_mode_t m)
 	}
 }
 
-static void load_stream_config(rss_config_t *cfg, const char *section,
-			       rvd_stream_t *s, int default_w, int default_h,
-			       int default_fps, int default_br);
+static void load_stream_config(rss_config_t *cfg, const char *section, rvd_stream_t *s,
+			       int default_w, int default_h, int default_fps, int default_br);
 
 static int rvd_pipeline_init_v4l2(rvd_state_t *st)
 {
@@ -397,9 +473,14 @@ int rvd_pipeline_init(rvd_state_t *st)
 		return RSS_ERR;
 	}
 	st->ops = rss_hal_get_ops(st->hal_ctx);
-	if (strcasecmp(rss_config_get_str(cfg, "system", "video_backend", "imp"),
-		       "v4l2") == 0)
+	if (strcasecmp(rss_config_get_str(cfg, "system", "video_backend", "imp"), "v4l2") == 0) {
+		if (!rvd_v4l2_h264_supported()) {
+			RSS_FATAL("V4L2/OpenIMP backend requested but Raptor was built without "
+				  "V4L2_OPENIMP=1");
+			return RSS_ERR_NOTSUP;
+		}
 		return rvd_pipeline_init_v4l2(st);
+	}
 
 	/* ── 2. Sensor config ── */
 	rss_multi_sensor_config_t multi_cfg = {0};
@@ -477,13 +558,21 @@ int rvd_pipeline_init(rvd_state_t *st)
 
 	/* ── 3. OSD pool sizing — must be set before HAL init (SDK requirement).
 	 * Scan [osd.*] config sections to estimate total region bytes.
-	 * Pool cannot be resized after init, so we must get it right here. */
+	 * Pool cannot be resized after init, so we must get it right here.
+	 * The sensor resolution is unknowable at this point — the procfs
+	 * nodes under /proc/jz/sensor/sensorN/ are created by ISP init,
+	 * which this must precede (confirmed on a z55: a pre-init read
+	 * finds nothing once the previous instance has deinitialized) —
+	 * so unset stream dims fall back to a 4MP-class ceiling for POOL
+	 * sizing only. The streams themselves resolve their dims after
+	 * init from the sensor; the values stored by these reads are
+	 * display-only and never become configuration. */
 	{
 		int font_size = rss_config_get_int(cfg, "osd", "font_size", 24);
 		if (font_size < 10)
 			font_size = 10;
-		int main_w = rss_config_get_int(cfg, "stream0", "width", 1920);
-		int main_h = rss_config_get_int(cfg, "stream0", "height", 1080);
+		int main_w = rss_config_get_int(cfg, "stream0", "width", 2560);
+		int main_h = rss_config_get_int(cfg, "stream0", "height", 1440);
 		int sub_w = rss_config_get_int(cfg, "stream1", "width", 640);
 		int sub_h = rss_config_get_int(cfg, "stream1", "height", 360);
 		bool has_sub = rss_config_get_bool(cfg, "stream1", "enabled", true);
@@ -549,7 +638,47 @@ int rvd_pipeline_init(rvd_state_t *st)
 			sensor_fps = 25;
 		/* Sensor 0 FPS via legacy ops */
 		ret = RSS_HAL_CALL(st->ops, isp_set_sensor_fps, st->hal_ctx, sensor_fps, 1);
-		if (ret != RSS_OK)
+		if (ret == RSS_ERR_NOTSUP) {
+			/*
+			 * Not a fault, so not a warning. An op a backend leaves out
+			 * answers NOTSUP through the RSS_HAL_CALL NULL guard, and a
+			 * backend may return it outright; either way the daemon is
+			 * expected to carry on (docs 10-hal-api.md 9.3). On some SoCs
+			 * the sensor rate is fixed when the mode is selected during
+			 * bring-up and cannot be changed afterwards -- the encoder
+			 * framerate is what varies there.
+			 *
+			 * Report the rate the sensor actually runs at rather than the
+			 * one that was refused. The refused number describes nothing,
+			 * and printing it invites the conclusion that the pipeline is
+			 * running at it.
+			 */
+			uint32_t num = 0, den = 0;
+			int actual = 0;
+
+			if (RSS_HAL_CALL(st->ops, isp_get_sensor_fps, st->hal_ctx, &num, &den) ==
+				    RSS_OK &&
+			    num && den)
+				actual = (int)((num + den / 2) / den);
+
+			if (!actual)
+				/* Nothing can report the rate, and sensor_fps may be the
+				 * 25 fallback rather than anything measured, so do not
+				 * present it as the sensor's. */
+				RSS_INFO("sensor0 fps: neither settable nor readable on this "
+					 "platform -- streams are configured against %d, which "
+					 "no source confirmed",
+					 sensor_fps);
+			else if (actual != sensor_fps)
+				RSS_INFO("sensor0 fps: not settable on this platform -- the "
+					 "sensor runs at %d, not the %d asked for, and streams "
+					 "are paced down from it",
+					 actual, sensor_fps);
+			else
+				RSS_INFO("sensor0 fps: not settable on this platform; the "
+					 "sensor runs at %d",
+					 actual);
+		} else if (ret != RSS_OK)
 			RSS_WARN("isp_set_sensor_fps failed: %d (non-fatal)", ret);
 		else
 			RSS_INFO("sensor0 fps: %d", sensor_fps);
@@ -663,12 +792,14 @@ int rvd_pipeline_init(rvd_state_t *st)
 		RSS_HAL_CALL(st->ops, isp_set_custom_mode_n, st->hal_ctx, s, 0);
 	}
 
-	/* ── 3d. Read actual sensor resolution from /proc ── */
+	/* ── 3d. Read actual sensor resolution from /proc — the nodes are
+	 * created by ISP init, so this cannot run any earlier. With the
+	 * display-only getter defaults, the values resolved here (and the
+	 * sensor-derived stream fallbacks below) can no longer be shadowed
+	 * by the OSD estimate's earlier ceiling guesses. */
 	int sensor_w = 0, sensor_h = 0;
-	{
-		sensor_w = read_sensor_proc_int(0, "width", 10, 0);
-		sensor_h = read_sensor_proc_int(0, "height", 10, 0);
-	}
+	sensor_w = read_sensor_proc_int(0, "width", 10, 0);
+	sensor_h = read_sensor_proc_int(0, "height", 10, 0);
 	if (sensor_w > 0 && sensor_h > 0) {
 		RSS_INFO("sensor resolution: %dx%d", sensor_w, sensor_h);
 	} else {
@@ -694,6 +825,22 @@ int rvd_pipeline_init(rvd_state_t *st)
 				RSS_WARN("could not determine sensor resolution");
 			}
 		}
+	}
+
+	/* Baseline sensor rate — the restore target for the transient
+	 * set-sensor-fps override. Queried here because the tuning API is
+	 * only answerable once the ISP is up. A backend without the getter
+	 * reports 0/0 and the override verb degrades to explicit rates. */
+	st->sensor_base_fps_num = 0;
+	st->sensor_base_fps_den = 0;
+	if (RSS_HAL_CALL(st->ops, isp_get_sensor_fps, st->hal_ctx, &st->sensor_base_fps_num,
+			 &st->sensor_base_fps_den) == 0 &&
+	    st->sensor_base_fps_num > 0 && st->sensor_base_fps_den > 0) {
+		RSS_INFO("sensor rate: %u/%u fps", st->sensor_base_fps_num,
+			 st->sensor_base_fps_den);
+	} else {
+		st->sensor_base_fps_num = 0;
+		st->sensor_base_fps_den = 0;
 	}
 
 	/* Low latency: encoder releases frames immediately (saves 40-120ms) */
@@ -844,6 +991,15 @@ int rvd_pipeline_init(rvd_state_t *st)
 			st->streams[ji].fs_chn = st->streams[v].fs_chn;
 			st->streams[ji].chn = jpeg_chn;
 			st->streams[ji].sensor_idx = st->streams[v].sensor_idx;
+			/* Snapshot channels have no section of their own: they are
+			 * configured from the parent stream's, under jpeg_-prefixed
+			 * keys (jpeg_quality and jpeg_fps, read just above). Carrying
+			 * that section here is what lets a runtime change be written
+			 * back to the place it was read from -- left empty, a
+			 * persisted key lands sectionless at the top of the file,
+			 * where nothing reads it again. */
+			rss_strlcpy(st->streams[ji].cfg_sect, sect,
+				    sizeof(st->streams[ji].cfg_sect));
 			st->streams[ji].is_jpeg = true;
 			st->streams[ji].jpeg_idle = rss_config_get_bool(cfg, "jpeg", "idle", true);
 			st->streams[ji].enc_cfg.init_qp = quality;
@@ -1039,7 +1195,7 @@ int rvd_stream_init(rvd_state_t *st, int idx)
 	if (st->v4l2_backend) {
 		if (idx != 0)
 			return RSS_ERR_NOTSUP;
-		ret = rss_v4l2_h264_create(&st->v4l2, st->v4l2_device, &s->enc_cfg);
+		ret = rvd_v4l2_h264_create(&st->v4l2, st->v4l2_device, &s->enc_cfg);
 		if (ret != RSS_OK) {
 			RSS_ERROR("V4L2/OpenIMP backend create failed: %d", ret);
 			return ret;
@@ -1245,25 +1401,15 @@ int rvd_stream_init(rvd_state_t *st, int idx)
 create_ring:
 	/* ── Create ring (or reuse existing across encoder restart) ── */
 	if (s->ring) {
-		if (s->is_jpeg) {
-			int jpeg_idx = 0;
-			for (int j = 0; j < st->jpeg_count; j++) {
-				if (st->jpeg_streams[j] == idx) {
-					jpeg_idx = j;
-					break;
-				}
-			}
-			rss_ring_set_stream_info(s->ring, RVD_JPEG_STREAM_ID_BASE + jpeg_idx,
-						 RSS_CODEC_JPEG, s->enc_cfg.width,
-						 s->enc_cfg.height, s->enc_cfg.fps_num,
-						 s->enc_cfg.fps_den, 0, 0);
-		} else {
-			rss_ring_set_stream_info(
-				s->ring, idx, s->enc_cfg.codec, s->enc_cfg.width, s->enc_cfg.height,
-				s->enc_cfg.fps_num, s->enc_cfg.fps_den,
-				rvd_profile_idc(s->enc_cfg.profile),
-				rvd_level_idc(s->enc_cfg.width, s->enc_cfg.height));
-		}
+		rvd_stream_publish_info(st, idx);
+		/* The restart replaced the encoder's output region (the SHM
+		 * injection recreated the object; a resize changed the buffer
+		 * stride), but the REUSED ring still advertises the old one:
+		 * consumers keep resolving frames through a mapping of a
+		 * region nobody writes anymore and serve frozen bytes under
+		 * fresh slot metadata. Re-enabling bumps the ring's ref
+		 * generation, which is what tells them to remap. */
+		rvd_stream_enable_refmode(st, idx);
 		RSS_DEBUG("stream%d ring: reused", idx);
 	} else {
 		int local = s->fs_chn - fs_base_channel(s->sensor_idx);
@@ -1364,26 +1510,7 @@ create_ring:
 					rvd_profile_idc(s->enc_cfg.profile),
 					rvd_level_idc(s->enc_cfg.width, s->enc_cfg.height));
 
-				bool jpeg_codec = (s->enc_cfg.codec == RSS_CODEC_JPEG);
-				if (!jpeg_codec && st->refmode && st->refmode_shm &&
-				    st->enc_shm_size[idx] > 0) {
-					uint8_t cnt = s->enc_cfg.max_stream_cnt;
-					if (!cnt)
-						cnt = 2;
-					rss_ring_enable_refmode(s->ring, st->enc_shm_size[idx], 0,
-								cnt, st->enc_shm_size[idx] / cnt);
-				} else if (!jpeg_codec && st->refmode && !st->refmode_shm &&
-					   st->rmem_size > 0) {
-					uint32_t actual_stride = 0;
-					uint8_t actual_cnt = s->enc_cfg.max_stream_cnt;
-					RSS_HAL_CALL(st->ops, enc_get_stream_buf_size, st->hal_ctx,
-						     s->chn, &actual_stride);
-					if (!actual_cnt)
-						actual_cnt = 2;
-					rss_ring_enable_refmode(s->ring, st->rmem_size,
-								st->rmem_mmap_offset, actual_cnt,
-								actual_stride);
-				}
+				rvd_stream_enable_refmode(st, idx);
 			}
 		}
 
@@ -1400,7 +1527,7 @@ create_ring:
 	/* Rollback on failure */
 fail_ring:
 	if (st->v4l2_backend) {
-		rss_v4l2_h264_destroy(st->v4l2);
+		rvd_v4l2_h264_destroy(st->v4l2);
 		st->v4l2 = NULL;
 		return ret;
 	}
@@ -1437,7 +1564,7 @@ void rvd_stream_stop(rvd_state_t *st, int idx)
 	/* Stop encoder */
 	if (s->enabled) {
 		if (st->v4l2_backend)
-			rss_v4l2_h264_stop(st->v4l2);
+			rvd_v4l2_h264_stop(st->v4l2);
 		else
 			RSS_HAL_CALL(st->ops, enc_stop, st->hal_ctx, s->chn);
 		s->enabled = false;
@@ -1458,7 +1585,7 @@ void rvd_stream_deinit(rvd_state_t *st, int idx)
 	if (!s->ring)
 		return;
 	if (st->v4l2_backend) {
-		rss_v4l2_h264_destroy(st->v4l2);
+		rvd_v4l2_h264_destroy(st->v4l2);
 		st->v4l2 = NULL;
 		RSS_DEBUG("stream%d V4L2 backend deinit complete", idx);
 		return;
@@ -1524,7 +1651,7 @@ int rvd_stream_start(rvd_state_t *st, int idx)
 		s->enabled = false;
 	} else {
 		if (st->v4l2_backend) {
-			int backend_ret = rss_v4l2_h264_start(st->v4l2);
+			int backend_ret = rvd_v4l2_h264_start(st->v4l2);
 			if (backend_ret != RSS_OK) {
 				RSS_ERROR("stream%d: V4L2 start failed: %d", idx, backend_ret);
 				return backend_ret;
@@ -1551,7 +1678,7 @@ int rvd_stream_start(rvd_state_t *st, int idx)
 		atomic_store(&st->stream_active[idx], false);
 		if (s->enabled) {
 			if (st->v4l2_backend)
-				rss_v4l2_h264_stop(st->v4l2);
+				rvd_v4l2_h264_stop(st->v4l2);
 			else
 				RSS_HAL_CALL(st->ops, enc_stop, st->hal_ctx, s->chn);
 			s->enabled = false;

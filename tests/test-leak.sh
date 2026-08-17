@@ -143,7 +143,13 @@ rm -f "$LOG_DIR"/*.log "$LOG_DIR"/tsan.* "$LOG_DIR"/asan.*
 if [ "$SAN_MODE" = "tsan" ]; then
     export TSAN_OPTIONS="exitcode=66:log_path=$LOG_DIR/tsan:history_size=4"
 else
-    export ASAN_OPTIONS="detect_leaks=1:exitcode=23:log_path=$LOG_DIR/asan"
+    # detect_stack_use_after_return=0: the SHM ring mmap can land on
+    # pages ASAN still poisons as retired fake-stack frames, and the
+    # first publish memcpy into such a slot reports a bogus
+    # stack-use-after-return (seen as a 261-byte ring write "under-
+    # flowing" a 16-byte timespec in a dead frame). Leak and heap
+    # detection, the point of this stage, are unaffected.
+    export ASAN_OPTIONS="detect_leaks=1:exitcode=23:detect_stack_use_after_return=0:log_path=$LOG_DIR/asan"
 fi
 
 # ── Config ──
@@ -153,6 +159,14 @@ cat > "$LOG_DIR/leak-test.conf" << CONF
 model = gc2053
 name = gc2053
 i2c_addr = 0x37
+
+# Embedded rings on purpose. Integration and net-fallback run refmode
+# (the mock HAL injects encoder SHM), so this soak is the only
+# daemon-level coverage the embedded publish path gets -- and its
+# reconnect churn is what surfaced a wild write there. Flipping this to
+# true would leave that path exercised by unit tests alone.
+[ring]
+refmode = false
 
 [stream0]
 width = 1920
@@ -174,6 +188,7 @@ codec = h264
 enabled = true
 sample_rate = 16000
 codec = l16
+ao_enabled = true
 
 [rtsp]
 port = $RTSP_PORT
@@ -360,6 +375,19 @@ for codec in opus aac pcmu pcma l16; do
         "rtsp://127.0.0.1:$RTSP_PORT/stream0" > /dev/null 2>&1 || true
     echo "  $codec done"
 done
+sleep 1
+
+# ── Phase 1c: RAC playback + ao-drain ──
+# Exercises speaker ring create/publish, RAD's AO thread consume path,
+# and the ao-drain handshake (ctrl handler + AO thread flush + condvar).
+
+echo ""
+echo "=== Phase 1c: RAC playback + ao-drain ==="
+
+dd if=/dev/zero of="$LOG_DIR/rac-test.pcm" bs=32000 count=1 2>/dev/null
+timeout 10 "$OUT/rac" play "$LOG_DIR/rac-test.pcm" > /dev/null 2>&1 || true
+"$OUT/raptorctl" rad ao-drain > /dev/null 2>&1 || true
+echo "  rac playback done"
 sleep 1
 
 # ── Phase 2: Rapid connect/disconnect (amplify per-client leaks) ──

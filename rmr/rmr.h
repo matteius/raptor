@@ -19,6 +19,7 @@
 #include "rmr_prebuf.h"
 #include "rmr_sign.h"
 #include "rmr_storage.h"
+#include "rmr_timelapse.h"
 
 /* Recording mode */
 #define RMR_MODE_CONTINUOUS 0 /* always recording */
@@ -39,6 +40,7 @@ typedef struct {
 	rmr_sign_key_t sign_key;
 	rmr_sign_stream_t sign_seg;  /* continuous segment chain */
 	rmr_sign_stream_t sign_clip; /* motion clip chain */
+	rmr_sign_stream_t sign_tl;   /* timelapse file chain */
 
 	/* Rings */
 	rss_ring_t *video_ring;
@@ -53,6 +55,7 @@ typedef struct {
 	uint32_t fps_num;
 	uint32_t audio_codec;
 	uint32_t audio_sample_rate;
+	uint8_t audio_aot; /* AAC object type from ring header (2=LC, 5=HE v1) */
 
 	/* Codec params */
 	rmr_codec_params_t params;
@@ -63,6 +66,9 @@ typedef struct {
 	int segment_fd;
 	char segment_path[256];
 	int64_t segment_start_us;
+	int64_t segment_start_rt_us;	/* wall clock at open (boundary math) */
+	int64_t segment_boundary_rt_us; /* next wall-clock split point */
+	bool segment_idr_requested;	/* one sharpening IDR per boundary */
 
 	/* Pre-buffer for motion clips (main thread only) */
 	rmr_prebuf_t *video_pb;
@@ -80,6 +86,17 @@ typedef struct {
 	int64_t clip_a_ts_base; /* ring ts mapping base for clip_a_dts steering */
 	int64_t clip_start_us;	/* wall clock when clip opened */
 	uint64_t clip_bytes;
+
+	/* Timelapse (main thread only) */
+	bool tl_enabled; /* [timelapse] enabled, runtime-togglable */
+	rmr_tl_t tl;
+	rmr_storage_t *tl_storage;
+	rmr_mux_t *tl_mux;
+	int tl_fd;
+	char tl_path[256];
+	uint64_t tl_bytes;
+	uint64_t tl_frames_total;
+	int64_t tl_last_err_us; /* rate-limits open/write failure warns */
 
 	/* Frame read buffer (main thread only) */
 	uint8_t *frame_buf;

@@ -9,13 +9,35 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 
 #include "ric.h"
+#include "ric_json.h"
+
+/*
+ * The config file is a system boundary like the ctrl socket: the same
+ * ranges set-threshold enforces apply here, clamped to the nearest
+ * bound (the pulse_ms precedent). One line names what changed --
+ * a silently corrected config is a debugging session.
+ */
+static char clamped_keys[128];
+
+static int cfg_clamp(const char *key, int val, int lo, int hi)
+{
+	int out = val < lo ? lo : (val > hi ? hi : val);
+	if (out != val) {
+		size_t len = strlen(clamped_keys);
+		snprintf(clamped_keys + len, sizeof(clamped_keys) - len, "%s%s", len ? ", " : "",
+			 key);
+	}
+	return out;
+}
 
 static void load_config(ric_state_t *st)
 {
@@ -37,6 +59,11 @@ static void load_config(ric_state_t *st)
 	c->gpio_irled = rss_config_get_int(cfg, "ircut", "gpio_irled", -1);
 	c->gpio_irled2 = rss_config_get_int(cfg, "ircut", "gpio_irled2", -1);
 	c->ir850_enabled = rss_config_get_bool(cfg, "ircut", "ir850", true);
+	/* Probed before the get, because the getters store their default into
+	 * the config on a miss (for config-get-section) and the key would
+	 * always look present afterwards. The 940-only default below needs
+	 * to know the difference. */
+	c->ir940_explicit = rss_config_get_str(cfg, "ircut", "ir940", NULL) != NULL;
 	c->ir940_enabled = rss_config_get_bool(cfg, "ircut", "ir940", false);
 
 	/* Trigger mode: "luma" (default), "gain" (legacy), "adc", "photo" */
@@ -51,9 +78,20 @@ static void load_config(ric_state_t *st)
 		c->trigger = RIC_TRIGGER_LUMA;
 
 	/* Luma trigger thresholds */
-	c->night_luma = rss_config_get_int(cfg, "ircut", "night_luma", 20);
-	c->night_gain = rss_config_get_int(cfg, "ircut", "night_gain", 80000);
-	c->day_gain_pct = rss_config_get_int(cfg, "ircut", "day_gain_pct", 25);
+	c->night_luma =
+		cfg_clamp("night_luma", rss_config_get_int(cfg, "ircut", "night_luma", 20), 0, 255);
+	c->night_gain = cfg_clamp(
+		"night_gain", rss_config_get_int(cfg, "ircut", "night_gain", 80000), 0, INT_MAX);
+	c->day_gain_pct = cfg_clamp("day_gain_pct",
+				    rss_config_get_int(cfg, "ircut", "day_gain_pct", 25), 1, 100);
+	c->probe_gain_pct = cfg_clamp(
+		"probe_gain_pct", rss_config_get_int(cfg, "ircut", "probe_gain_pct", 90), 0, 99);
+	c->probe_holdoff_sec =
+		cfg_clamp("probe_holdoff_sec",
+			  rss_config_get_int(cfg, "ircut", "probe_holdoff_sec", 60), 1, 86400);
+	c->probe_recheck_sec =
+		cfg_clamp("probe_recheck_sec",
+			  rss_config_get_int(cfg, "ircut", "probe_recheck_sec", 600), 0, 86400);
 
 	/* ADC thresholds (trigger=adc) */
 	c->adc_channel = rss_config_get_int(cfg, "ircut", "adc_channel", 0);
@@ -68,93 +106,50 @@ static void load_config(ric_state_t *st)
 	c->photo.bgain_rec = (uint16_t)rss_config_get_int(cfg, "ircut", "photo_bgain_rec", 0);
 
 	/* Gain thresholds (legacy, only used when trigger=gain) */
-	c->night_threshold = rss_config_get_int(cfg, "ircut", "night_threshold", 40000);
-	c->day_threshold = rss_config_get_int(cfg, "ircut", "day_threshold", 25000);
+	c->night_threshold =
+		cfg_clamp("night_threshold",
+			  rss_config_get_int(cfg, "ircut", "night_threshold", 40000), 0, INT_MAX);
+	c->day_threshold =
+		cfg_clamp("day_threshold", rss_config_get_int(cfg, "ircut", "day_threshold", 25000),
+			  0, INT_MAX);
 
-	c->hysteresis_sec = rss_config_get_int(cfg, "ircut", "hysteresis_sec", 5);
+	c->hysteresis_sec = cfg_clamp(
+		"hysteresis_sec", rss_config_get_int(cfg, "ircut", "hysteresis_sec", 5), 1, 300);
+
+	/* Night sensor rate: 0 = off (default). The clamp floor of 1 only
+	 * applies to enabled values; rvd validates the rate against the
+	 * driver, this only keeps nonsense out of the transition path. */
+	c->night_fps = rss_config_get_int(cfg, "ircut", "night_fps", 0);
+	if (c->night_fps != 0)
+		c->night_fps = cfg_clamp("night_fps", c->night_fps, 1, 120);
 	int default_poll = (c->trigger == RIC_TRIGGER_PHOTO) ? 100 : 1000;
-	c->poll_interval_ms = rss_config_get_int(cfg, "ircut", "poll_interval_ms", default_poll);
+	c->poll_interval_ms = cfg_clamp(
+		"poll_interval_ms",
+		rss_config_get_int(cfg, "ircut", "poll_interval_ms", default_poll), 50, 10000);
+
+	/* Dual-GPIO coil pulse. 10ms is what the thingino ircut script has
+	 * driven the whole fleet with since thingino-daynight existed; both
+	 * 10ms and 100ms measured 20/20 reliable on a dual-GPIO Wyze Cam3,
+	 * so the default follows the fleet. Clamped: a zero pulse moves no
+	 * filter, and holding the coil for seconds is a heater. */
+	c->pulse_ms =
+		cfg_clamp("pulse_ms", rss_config_get_int(cfg, "ircut", "pulse_ms", 10), 1, 1000);
+
+	if (clamped_keys[0])
+		RSS_WARN("config values out of range, clamped: %s", clamped_keys);
+
+	/* The photo state machine assumes bright < dark < very dark;
+	 * inverted thresholds silently break the deep-count logic. */
+	if (c->trigger == RIC_TRIGGER_PHOTO &&
+	    (c->photo.ev_day >= c->photo.ev_night || c->photo.ev_night >= c->photo.ev_deep))
+		RSS_WARN("photo thresholds out of order (need ev_day %u < ev_night %u < ev_deep "
+			 "%u) -- detection will misbehave",
+			 c->photo.ev_day, c->photo.ev_night, c->photo.ev_deep);
 }
 
-/*
- * Auto-discover GPIO pins from /etc/thingino.json when raptor.conf
- * leaves them at -1.  Format:
- *   "ircut": "57 58"   (one or two GPIOs, space-separated string)
- *   "ircut": 57         (single GPIO as integer)
- *   "ir850": 8          (IR LED GPIO)
- *   "ir940": 9          (IR LED GPIO, used if ir850 absent)
- */
+/* Pins may also be auto-discovered from the thingino device file
+ * when raptor.conf leaves them at -1 (see ric_json.c). */
 #define THINGINO_JSON "/etc/thingino.json"
-#define GPIO_PIN_MAX  191
-
-static bool valid_gpio(int pin)
-{
-	return pin >= 0 && pin <= GPIO_PIN_MAX;
-}
-
-static void load_gpio_from_thingino_json(ric_config_t *c)
-{
-	if (c->gpio_ircut >= 0 && c->gpio_irled >= 0 && c->gpio_irled2 >= 0)
-		return;
-
-	FILE *f = fopen(THINGINO_JSON, "r");
-	if (!f)
-		return;
-
-	char buf[2048];
-	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-	fclose(f);
-	if (n == 0)
-		return;
-	buf[n] = '\0';
-
-	cJSON *root = cJSON_Parse(buf);
-	if (!root)
-		return;
-
-	cJSON *gpio = cJSON_GetObjectItemCaseSensitive(root, "gpio");
-	if (!cJSON_IsObject(gpio)) {
-		cJSON_Delete(root);
-		return;
-	}
-
-	if (c->gpio_ircut < 0) {
-		cJSON *ircut = cJSON_GetObjectItemCaseSensitive(gpio, "ircut");
-		if (cJSON_IsNumber(ircut) && valid_gpio(ircut->valueint)) {
-			c->gpio_ircut = ircut->valueint;
-		} else if (cJSON_IsString(ircut) && ircut->valuestring) {
-			char *endp;
-			int val = (int)strtol(ircut->valuestring, &endp, 10);
-			if (endp != ircut->valuestring && valid_gpio(val)) {
-				c->gpio_ircut = val;
-				while (*endp == ' ')
-					endp++;
-				char *endp2;
-				val = (int)strtol(endp, &endp2, 10);
-				if (endp2 != endp && valid_gpio(val))
-					c->gpio_ircut2 = val;
-			}
-		}
-	}
-
-	if (c->gpio_irled < 0) {
-		cJSON *ir850 = cJSON_GetObjectItemCaseSensitive(gpio, "ir850");
-		if (cJSON_IsNumber(ir850) && valid_gpio(ir850->valueint))
-			c->gpio_irled = ir850->valueint;
-	}
-
-	if (c->gpio_irled2 < 0) {
-		cJSON *ir940 = cJSON_GetObjectItemCaseSensitive(gpio, "ir940");
-		if (cJSON_IsNumber(ir940) && valid_gpio(ir940->valueint))
-			c->gpio_irled2 = ir940->valueint;
-	}
-
-	cJSON_Delete(root);
-
-	if (c->gpio_ircut >= 0 || c->gpio_irled >= 0)
-		RSS_INFO("GPIOs from %s: ircut=%d ircut2=%d irled=%d irled2=%d", THINGINO_JSON,
-			 c->gpio_ircut, c->gpio_ircut2, c->gpio_irled, c->gpio_irled2);
-}
 
 /* ── Control socket ── */
 
@@ -189,17 +184,76 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 		return rss_ctrl_resp_json(resp_buf, resp_buf_size, r);
 	}
 
+	/*
+	 * Manual hardware control, one piece at a time. Deliberately does
+	 * not touch current_mode or opmode: this is a bench tool, and the
+	 * next automatic transition reasserts whatever auto wants -- the
+	 * response carries the operating mode so the caller knows whether
+	 * that can happen. The LED commands also ignore the ir850/ir940
+	 * enable flags on purpose: those gate automatic behavior, while a
+	 * manual command is explicit intent (lighting a disabled bank from
+	 * the shell is exactly what bench debugging needs).
+	 *
+	 * These handlers knowingly block the ctrl socket: an ircut move
+	 * holds the coil for pulse_ms (capped 1s) and a forced mode adds
+	 * an ISP call with a 2s timeout. Worst case sits inside the 5s
+	 * send budget, and the hardware pulse cannot be shortened.
+	 */
+	if (strcmp(cmd, "ircut") == 0) {
+		char val[8];
+		if (rss_json_get_str(cmd_json, "value", val, sizeof(val)) != 0 ||
+		    (strcmp(val, "day") != 0 && strcmp(val, "night") != 0))
+			return rss_ctrl_resp_error(resp_buf, resp_buf_size, "need value day|night");
+		if (ric_ircut_drive(st, strcmp(val, "night") == 0 ? RIC_MODE_NIGHT : RIC_MODE_DAY) <
+		    0)
+			return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+						   "no ircut pins configured");
+		RSS_INFO("manual ircut -> %s", val);
+		cJSON *r = cJSON_CreateObject();
+		cJSON_AddStringToObject(r, "status", "ok");
+		cJSON_AddStringToObject(r, "ircut", val);
+		cJSON_AddStringToObject(r, "mode",
+					st->settings.opmode == RIC_AUTO	       ? "auto"
+					: st->settings.opmode == RIC_FORCE_DAY ? "day"
+									       : "night");
+		return rss_ctrl_resp_json(resp_buf, resp_buf_size, r);
+	}
+
+	if (strcmp(cmd, "ir850") == 0 || strcmp(cmd, "ir940") == 0) {
+		char val[8];
+		bool bank940 = cmd[2] == '9';
+		if (rss_json_get_str(cmd_json, "value", val, sizeof(val)) != 0 ||
+		    (strcmp(val, "on") != 0 && strcmp(val, "off") != 0))
+			return rss_ctrl_resp_error(resp_buf, resp_buf_size, "need value on|off");
+		if (ric_irled_drive(st, bank940, strcmp(val, "on") == 0) < 0)
+			return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+						   bank940 ? "no ir940 pin configured"
+							   : "no ir850 pin configured");
+		RSS_INFO("manual %s -> %s", cmd, val);
+		cJSON *r = cJSON_CreateObject();
+		cJSON_AddStringToObject(r, "status", "ok");
+		cJSON_AddStringToObject(r, cmd, val);
+		cJSON_AddStringToObject(r, "mode",
+					st->settings.opmode == RIC_AUTO	       ? "auto"
+					: st->settings.opmode == RIC_FORCE_DAY ? "day"
+									       : "night");
+		return rss_ctrl_resp_json(resp_buf, resp_buf_size, r);
+	}
+
 	if (strcmp(cmd, "mode") == 0) {
 		char val[16];
 		if (rss_json_get_str(cmd_json, "value", val, sizeof(val)) == 0) {
 			if (strcmp(val, "day") == 0) {
 				st->settings.opmode = RIC_FORCE_DAY;
-				ric_set_mode(st, RIC_MODE_DAY);
+				ric_force_mode(st, RIC_MODE_DAY);
 			} else if (strcmp(val, "night") == 0) {
 				st->settings.opmode = RIC_FORCE_NIGHT;
-				ric_set_mode(st, RIC_MODE_NIGHT);
-			} else {
+				ric_force_mode(st, RIC_MODE_NIGHT);
+			} else if (strcmp(val, "auto") == 0) {
 				st->settings.opmode = RIC_AUTO;
+			} else {
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "need value auto|day|night");
 			}
 			rss_config_set_str(st->cfg, "ircut", "mode", val);
 		}
@@ -223,6 +277,7 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 
 		ric_config_t *c = &st->settings;
 		const char *cfg_key = NULL;
+		bool bool_key = false;
 		if (strcmp(key, "night_luma") == 0) {
 			if (val < 0 || val > 255)
 				return rss_ctrl_resp_error(resp_buf, resp_buf_size, "range 0-255");
@@ -259,6 +314,32 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 							   "range 50-10000");
 			c->poll_interval_ms = val;
 			cfg_key = "poll_interval_ms";
+		} else if (strcmp(key, "probe_gain_pct") == 0) {
+			if (val < 0 || val > 99)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size, "range 0-99");
+			c->probe_gain_pct = val;
+			cfg_key = "probe_gain_pct";
+		} else if (strcmp(key, "probe_holdoff_sec") == 0) {
+			if (val < 1 || val > 86400)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "range 1-86400");
+			c->probe_holdoff_sec = val;
+			cfg_key = "probe_holdoff_sec";
+		} else if (strcmp(key, "probe_recheck_sec") == 0) {
+			if (val < 0 || val > 86400)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "range 0-86400");
+			c->probe_recheck_sec = val;
+			/* Take effect now: a countdown armed with the old
+			 * interval would ignore a shorter one until the next
+			 * night entry. */
+			{
+				int polls = val * 1000 /
+					    (c->poll_interval_ms > 0 ? c->poll_interval_ms : 1000);
+				if (st->probe_recheck_polls > polls)
+					st->probe_recheck_polls = polls;
+			}
+			cfg_key = "probe_recheck_sec";
 		} else if (strcmp(key, "photo_ev_night") == 0) {
 			if (val < 0)
 				return rss_ctrl_resp_error(resp_buf, resp_buf_size, "must be >= 0");
@@ -286,14 +367,125 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 							   "range 0-65535");
 			c->photo.bgain_rec = (uint16_t)val;
 			cfg_key = "photo_bgain_rec";
+		} else if (strcmp(key, "night_fps") == 0) {
+			if (val != 0 && (val < 1 || val > 120))
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "range 0 (off) or 1-120");
+			/* Re-arm: the operator changing the knob is the
+			 * signal to try the backend again. */
+			st->night_fps_unusable = false;
+			/* Take effect now if the regime it governs is
+			 * active. Switching it off mid-night restores the
+			 * base rate before the knob forgets it was on. */
+			if (st->current_mode == RIC_MODE_NIGHT) {
+				if (val > 0) {
+					c->night_fps = val;
+					ric_apply_night_fps(st, RIC_MODE_NIGHT);
+				} else if (c->night_fps > 0) {
+					ric_apply_night_fps(st, RIC_MODE_DAY);
+				}
+			}
+			c->night_fps = val;
+			cfg_key = "night_fps";
+		} else if (strcmp(key, "ir850") == 0 || strcmp(key, "ir940") == 0) {
+			if (val != 0 && val != 1)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size, "0 or 1");
+			bool bank940 = (key[2] == '9');
+			bool on = (val == 1);
+			if (bank940) {
+				c->ir940_enabled = on;
+				c->ir940_explicit = true;
+			} else {
+				c->ir850_enabled = on;
+			}
+			/* Policy applies NOW if the regime it governs is
+			 * active: a window-facing camera disabling a bank
+			 * mid-night must see the reflection die immediately,
+			 * not at the next transition. In day the flag simply
+			 * waits for the next night entry. */
+			if (st->current_mode == RIC_MODE_NIGHT)
+				ric_irled_drive(st, bank940, on);
+			cfg_key = bank940 ? "ir940" : "ir850";
+			bool_key = true;
+		} else if (strcmp(key, "adc_night") == 0) {
+			if (val < 0 || val > 65535)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "range 0-65535");
+			if (val >= c->adc_day)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "must be below adc_day");
+			c->adc_night = val;
+			cfg_key = "adc_night";
+		} else if (strcmp(key, "adc_day") == 0) {
+			if (val < 0 || val > 65535)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "range 0-65535");
+			if (val <= c->adc_night)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "must be above adc_night");
+			c->adc_day = val;
+			cfg_key = "adc_day";
+		} else if (strcmp(key, "pulse_ms") == 0) {
+			if (val < 1 || val > 1000)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size, "range 1-1000");
+			c->pulse_ms = val;
+			cfg_key = "pulse_ms";
 		} else {
 			return rss_ctrl_resp_error(resp_buf, resp_buf_size, "unknown key");
 		}
 
 		char valbuf[16];
 		snprintf(valbuf, sizeof(valbuf), "%d", val);
-		rss_config_set_str(st->cfg, "ircut", cfg_key, valbuf);
+		rss_config_set_str(st->cfg, "ircut", cfg_key,
+				   bool_key ? (val ? "true" : "false") : valbuf);
 		RSS_INFO("threshold %s set to %d", key, val);
+		return rss_ctrl_resp_ok(resp_buf, resp_buf_size);
+	}
+
+	if (strcmp(cmd, "set-trigger") == 0) {
+		char tbuf[16] = "";
+		if (rss_json_get_str(cmd_json, "value", tbuf, sizeof(tbuf)) != 0)
+			return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+						   "need value (luma, gain, adc, photo)");
+		ric_config_t *c = &st->settings;
+		ric_trigger_t t;
+		if (strcmp(tbuf, "luma") == 0)
+			t = RIC_TRIGGER_LUMA;
+		else if (strcmp(tbuf, "gain") == 0)
+			t = RIC_TRIGGER_GAIN;
+		else if (strcmp(tbuf, "adc") == 0)
+			t = RIC_TRIGGER_ADC;
+		else if (strcmp(tbuf, "photo") == 0)
+			t = RIC_TRIGGER_PHOTO;
+		else
+			return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+						   "unknown trigger (luma, gain, adc, photo)");
+		if (t == c->trigger)
+			return rss_ctrl_resp_ok(resp_buf, resp_buf_size);
+
+		/* Startup falls back to luma when the ADC is missing; a
+		 * runtime switch is explicit operator intent and gets the
+		 * failure instead of a silent substitution. */
+		if (t == RIC_TRIGGER_ADC && !st->adc_initialized) {
+			if (!ric_adc_start(st))
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size,
+							   "ADC unavailable");
+			st->adc_initialized = true;
+		}
+
+		c->trigger = t;
+		ric_trigger_rearm(st);
+		if (t == RIC_TRIGGER_PHOTO && c->photo.rgain_rec > 0 && c->photo.bgain_rec > 0) {
+			/* Same config-provided AWB baseline startup honors. */
+			st->photo.rgain_base = c->photo.rgain_rec;
+			st->photo.bgain_base = c->photo.bgain_rec;
+			st->photo.calibrated = true;
+		}
+		rss_config_set_str(st->cfg, "ircut", "trigger", tbuf);
+		RSS_INFO("trigger switched to %s%s", tbuf,
+			 (t == RIC_TRIGGER_PHOTO && c->poll_interval_ms > 200)
+				 ? " (poll_interval_ms 100 recommended for photo)"
+				 : "");
 		return rss_ctrl_resp_ok(resp_buf, resp_buf_size);
 	}
 
@@ -315,18 +507,27 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 		cJSON_AddNumberToObject(r, "day_threshold", c->day_threshold);
 		cJSON_AddNumberToObject(r, "hysteresis_sec", c->hysteresis_sec);
 		cJSON_AddNumberToObject(r, "poll_interval_ms", c->poll_interval_ms);
+		cJSON_AddNumberToObject(r, "night_fps", c->night_fps);
 		cJSON_AddNumberToObject(r, "photo_ev_night", c->photo.ev_night);
 		cJSON_AddNumberToObject(r, "photo_ev_deep", c->photo.ev_deep);
 		cJSON_AddNumberToObject(r, "photo_ev_day", c->photo.ev_day);
 		cJSON_AddNumberToObject(r, "photo_rgain_rec", c->photo.rgain_rec);
 		cJSON_AddNumberToObject(r, "photo_bgain_rec", c->photo.bgain_rec);
+		cJSON_AddNumberToObject(r, "probe_gain_pct", c->probe_gain_pct);
+		cJSON_AddNumberToObject(r, "probe_holdoff_sec", c->probe_holdoff_sec);
+		cJSON_AddNumberToObject(r, "probe_recheck_sec", c->probe_recheck_sec);
+		cJSON_AddBoolToObject(r, "ir850", c->ir850_enabled);
+		cJSON_AddBoolToObject(r, "ir940", c->ir940_enabled);
+		cJSON_AddNumberToObject(r, "adc_night", c->adc_night);
+		cJSON_AddNumberToObject(r, "adc_day", c->adc_day);
+		cJSON_AddNumberToObject(r, "pulse_ms", c->pulse_ms);
 		return rss_ctrl_resp_json(resp_buf, resp_buf_size, r);
 	}
 
 	if (strcmp(cmd, "config-show") == 0) {
 		char exp_resp[256] = {0};
-		rss_ctrl_send_command(RSS_RUN_DIR "/rvd.sock", "{\"cmd\":\"get-exposure\"}",
-				      exp_resp, sizeof(exp_resp), 1000);
+		rss_ctrl_cmd(RSS_RUN_DIR "/rvd.sock", "get-exposure", exp_resp, sizeof(exp_resp),
+			     1000);
 		cJSON *r = cJSON_CreateObject();
 		if (!r)
 			return rss_ctrl_resp_error(resp_buf, resp_buf_size, "alloc");
@@ -350,21 +551,25 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 		return rss_ctrl_resp_json(resp_buf, resp_buf_size, r);
 	}
 
-	/* Default: status */
-	char exp_resp[256] = {0};
-	rss_ctrl_send_command(RSS_RUN_DIR "/rvd.sock", "{\"cmd\":\"get-exposure\"}", exp_resp,
-			      sizeof(exp_resp), 1000);
-	cJSON *r = cJSON_CreateObject();
-	cJSON_AddStringToObject(r, "status", "ok");
-	cJSON_AddStringToObject(r, "mode",
-				st->settings.opmode == RIC_AUTO	       ? "auto"
-				: st->settings.opmode == RIC_FORCE_DAY ? "day"
-								       : "night");
-	cJSON_AddStringToObject(r, "state", st->current_mode == RIC_MODE_DAY ? "day" : "night");
-	cJSON *sub = exp_resp[0] ? cJSON_Parse(exp_resp) : NULL;
-	if (sub)
-		cJSON_AddItemToObject(r, "exposure", sub);
-	return rss_ctrl_resp_json(resp_buf, resp_buf_size, r);
+	if (strcmp(cmd, "status") == 0) {
+		char exp_resp[256] = {0};
+		rss_ctrl_cmd(RSS_RUN_DIR "/rvd.sock", "get-exposure", exp_resp, sizeof(exp_resp),
+			     1000);
+		cJSON *r = cJSON_CreateObject();
+		cJSON_AddStringToObject(r, "status", "ok");
+		cJSON_AddStringToObject(r, "mode",
+					st->settings.opmode == RIC_AUTO	       ? "auto"
+					: st->settings.opmode == RIC_FORCE_DAY ? "day"
+									       : "night");
+		cJSON_AddStringToObject(r, "state",
+					st->current_mode == RIC_MODE_DAY ? "day" : "night");
+		cJSON *sub = exp_resp[0] ? cJSON_Parse(exp_resp) : NULL;
+		if (sub)
+			cJSON_AddItemToObject(r, "exposure", sub);
+		return rss_ctrl_resp_json(resp_buf, resp_buf_size, r);
+	}
+
+	return rss_ctrl_resp_error(resp_buf, resp_buf_size, "unknown command");
 }
 
 /* ── Entry point ── */
@@ -376,6 +581,7 @@ int main(int argc, char **argv)
 	if (ret != 0)
 		return ret < 0 ? 1 : 0;
 	ric_state_t st = {0};
+	st.adc_fd = -1;
 	int epoll_fd = -1;
 
 	if (!rss_config_get_bool(ctx.cfg, "ircut", "enabled", true)) {
@@ -388,14 +594,27 @@ int main(int argc, char **argv)
 	st.running = ctx.running;
 	st.current_mode = RIC_MODE_DAY;
 	load_config(&st);
-	load_gpio_from_thingino_json(&st.settings);
+	ric_json_gpio_load(&st.settings, THINGINO_JSON);
+
+	/* The only IR bank a board has must light by default. ir940 defaults
+	 * to off as the opt-in second bank, which left a 940nm-only board
+	 * blind at night with a clean log unless a config said otherwise --
+	 * found in the field on a wuuk y0510. Decided here, after discovery,
+	 * because that is when the bank topology is finally known; only the
+	 * shipped default is overridden, an explicit ir940 key keeps its say. */
+	if (st.settings.gpio_irled < 0 && st.settings.gpio_irled2 >= 0 &&
+	    !st.settings.ir940_enabled && !st.settings.ir940_explicit) {
+		st.settings.ir940_enabled = true;
+		RSS_INFO("940nm is the only IR bank; enabling it "
+			 "(set ircut.ir940 = false to override)");
+	}
 
 	/* Wait for RVD control socket to be available */
 	RSS_DEBUG("waiting for RVD...");
 	for (int i = 0; i < 100 && *st.running; i++) {
 		char resp[256];
-		if (rss_ctrl_send_command(RSS_RUN_DIR "/rvd.sock", "{\"cmd\":\"get-exposure\"}",
-					  resp, sizeof(resp), 1000) >= 0) {
+		if (rss_ctrl_cmd(RSS_RUN_DIR "/rvd.sock", "get-exposure", resp, sizeof(resp),
+				 1000) >= 0) {
 			RSS_INFO("RVD ready (%s)", resp);
 			break;
 		}
@@ -428,7 +647,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Apply initial mode -- force GPIOs to known state at startup */
-	st.current_mode = -1;
+	st.current_mode = RIC_MODE_UNSET;
 	if (st.settings.opmode == RIC_FORCE_DAY)
 		ric_set_mode(&st, RIC_MODE_DAY);
 	else if (st.settings.opmode == RIC_FORCE_NIGHT)

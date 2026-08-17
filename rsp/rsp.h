@@ -14,6 +14,7 @@
 
 #include "rsp_rtmp.h"
 #include "rsp_audio.h"
+#include "rsp_net.h"
 #include "rmr_nal.h"
 
 typedef struct {
@@ -40,6 +41,7 @@ typedef struct {
 	uint32_t fps_num;
 	uint32_t audio_codec;
 	uint32_t audio_sample_rate;
+	uint8_t audio_profile; /* AAC AOT: 2=LC, 5=HE-AAC v1 */
 
 	/* Codec params */
 	rmr_codec_params_t params;
@@ -61,6 +63,13 @@ typedef struct {
 	/* RTMP connection */
 	rsp_rtmp_t rtmp;
 	bool header_sent;
+
+	/* RTP-over-UDP mode (url = udp://host:port); video only */
+	bool net_mode;
+	rsp_net_t net;
+	/* set-url runs on the ctrl thread; the main loop owns the
+	 * socket, so reopen is requested rather than done in place */
+	_Atomic bool net_reopen;
 
 	/* Parsed URL components */
 	char host[256];

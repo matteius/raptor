@@ -73,6 +73,7 @@ void *rvd_encoder_thread(void *arg)
 		  s->enc_cfg.height);
 
 	uint64_t frame_count = 0;
+	int64_t last_pub_warn_us = 0;
 	int poll_errors = 0;
 	int64_t last_stats = rss_timestamp_us();
 	int64_t last_reap = last_stats;
@@ -85,8 +86,9 @@ void *rvd_encoder_thread(void *arg)
 	 * each configured frame. Skipped at near-continuous rates
 	 * where start/stop churn would exceed the savings.
 	 */
-	const rss_hal_caps_t *caps = !st->v4l2_backend && st->ops->get_caps
-				       ? st->ops->get_caps(st->hal_ctx) : NULL;
+	const rss_hal_caps_t *caps = NULL;
+	if (!st->v4l2_backend && st->ops->get_caps)
+		caps = st->ops->get_caps(st->hal_ctx);
 	int64_t pulse_interval_us = 0;
 	bool pulse =
 		s->is_jpeg && s->jpeg_idle && caps && caps->jpeg_pulse && s->enc_cfg.fps_num > 0;
@@ -151,19 +153,29 @@ void *rvd_encoder_thread(void *arg)
 			}
 		}
 
-		/* Check for consumer IDR request (set via ring header flag) */
-		if (s->ring && rss_ring_check_idr(s->ring)) {
+		/*
+		 * Check for consumer IDR request (set via ring header flag).
+		 *
+		 * Not for JPEG: every MJPEG frame is already intra, so there is
+		 * no such thing as a keyframe request on that channel. The
+		 * consumers' skip and overflow paths raise the flag without
+		 * consulting the ring's codec, and this loop is the only place
+		 * that acts on it, so one gate here covers every raiser.
+		 */
+		if (s->ring && rss_ring_check_idr(s->ring) && !s->is_jpeg) {
 			if (st->v4l2_backend)
-				rss_v4l2_h264_request_idr(st->v4l2);
+				rvd_v4l2_h264_request_idr(st->v4l2);
 			else
 				RSS_HAL_CALL(st->ops, enc_request_idr, st->hal_ctx, s->chn);
 		}
 
 		/* Block until encoder has a frame (up to 1 second timeout).
 		 * Each thread blocks independently so channels don't starve. */
-		int ret = st->v4l2_backend
-				  ? rss_v4l2_h264_poll(st->v4l2, 1000)
-				  : RSS_HAL_CALL(st->ops, enc_poll, st->hal_ctx, s->chn, 1000);
+		int ret;
+		if (st->v4l2_backend)
+			ret = rvd_v4l2_h264_poll(st->v4l2, 1000);
+		else
+			ret = RSS_HAL_CALL(st->ops, enc_poll, st->hal_ctx, s->chn, 1000);
 		if (ret != RSS_OK) {
 			/* Timeouts are normal (sensor idle, JPEG on-demand stopped).
 			 * Log on repeated failures to catch flaky sensor/encoder. */
@@ -175,9 +187,10 @@ void *rvd_encoder_thread(void *arg)
 		poll_errors = 0;
 
 		rss_frame_t frame;
-		ret = st->v4l2_backend
-			      ? rss_v4l2_h264_get_frame(st->v4l2, &frame)
-			      : RSS_HAL_CALL(st->ops, enc_get_frame, st->hal_ctx, s->chn, &frame);
+		if (st->v4l2_backend)
+			ret = rvd_v4l2_h264_get_frame(st->v4l2, &frame);
+		else
+			ret = RSS_HAL_CALL(st->ops, enc_get_frame, st->hal_ctx, s->chn, &frame);
 		if (ret == -EAGAIN)
 			continue; /* no frame this time (empty stream / JPEG fps divider) */
 		if (ret != RSS_OK) {
@@ -223,11 +236,14 @@ void *rvd_encoder_thread(void *arg)
 			 * vaddr < ref_base prevents vaddr - ref_base wrap. */
 			if (!ref_base || total_len64 > ref_size || vaddr < ref_base ||
 			    vaddr - ref_base > ref_size - total_len64) {
-				if (frame_count == 0)
+				int64_t now_us = rss_timestamp_us();
+				if (now_us - last_pub_warn_us > 5000000) {
+					last_pub_warn_us = now_us;
 					RSS_WARN("stream%d: vaddr 0x%lx outside ref region "
 						 "[0x%lx..0x%lx], embedded fallback",
 						 idx, (unsigned long)vaddr, (unsigned long)ref_base,
 						 (unsigned long)(ref_base + ref_size));
+				}
 				goto embedded_publish;
 			}
 
@@ -258,9 +274,22 @@ void *rvd_encoder_thread(void *arg)
 			}
 		found_buf:
 
-			rss_ring_publish_ref(s->ring, rmem_off, (uint32_t)total_len64,
-					     frame.timestamp, primary_nal_type(&frame),
-					     frame.is_key ? 1 : 0, buf_idx);
+			ret = rss_ring_publish_ref(s->ring, rmem_off, (uint32_t)total_len64,
+						   frame.timestamp, primary_nal_type(&frame),
+						   frame.is_key ? 1 : 0, buf_idx);
+			if (ret != 0) {
+				/* A rejected publish is a dropped frame the ring
+				 * never saw; if it is a keyframe, every client in
+				 * the keyframe hold starves until the next one. */
+				int64_t now_us = rss_timestamp_us();
+				if (now_us - last_pub_warn_us > 5000000) {
+					last_pub_warn_us = now_us;
+					RSS_WARN("stream%d: publish_ref failed (%d), "
+						 "buf_idx=%u key=%d len=%llu",
+						 idx, ret, buf_idx, frame.is_key ? 1 : 0,
+						 (unsigned long long)total_len64);
+				}
+			}
 		} else {
 		embedded_publish:
 			/* Embedded mode: copy NALs into ring via scatter-gather */
@@ -274,12 +303,20 @@ void *rvd_encoder_thread(void *arg)
 				iov[n].data = frame.nals[n].data;
 				iov[n].length = frame.nals[n].length;
 			}
-			rss_ring_publish_iov(s->ring, iov, cnt, frame.timestamp,
-					     primary_nal_type(&frame), frame.is_key ? 1 : 0);
+			ret = rss_ring_publish_iov(s->ring, iov, cnt, frame.timestamp,
+						   primary_nal_type(&frame), frame.is_key ? 1 : 0);
+			if (ret != 0) {
+				int64_t now_us = rss_timestamp_us();
+				if (now_us - last_pub_warn_us > 5000000) {
+					last_pub_warn_us = now_us;
+					RSS_WARN("stream%d: publish_iov failed (%d), key=%d", idx,
+						 ret, frame.is_key ? 1 : 0);
+				}
+			}
 		}
 
 		if (st->v4l2_backend)
-			rss_v4l2_h264_release_frame(st->v4l2, &frame);
+			rvd_v4l2_h264_release_frame(st->v4l2, &frame);
 		else
 			RSS_HAL_CALL(st->ops, enc_release_frame, st->hal_ctx, s->chn, &frame);
 
@@ -365,6 +402,26 @@ void rvd_frame_loop(rvd_state_t *st, volatile sig_atomic_t *running)
 			for (int i = 0; i < n; i++) {
 				if (events[i].data.fd == ctrl_fd)
 					rss_ctrl_accept_and_handle(st->ctrl, rvd_ctrl_handler, st);
+				if (atomic_load(&st->pending_pipeline_reinit)) {
+					atomic_store(&st->pending_pipeline_reinit, false);
+					/* In-process reinit is unsafe on the old SDK
+					 * (System_Exit wedges with bound channels);
+					 * re-exec instead — process replacement
+					 * releases IMP exactly like the proven
+					 * kill-and-restart. */
+					RSS_WARN("re-exec for clean pipeline "
+						 "(post raw capture)");
+					char exe[256];
+					ssize_t rl =
+						readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+					if (rl > 0) {
+						exe[rl] = '\0';
+						char *av[] = {exe, "-c", (char *)st->config_path,
+							      NULL};
+						execv(exe, av);
+					}
+					RSS_ERROR("re-exec failed: %s", strerror(errno));
+				}
 			}
 		} else {
 			usleep(100000);

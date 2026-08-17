@@ -25,6 +25,7 @@ typedef struct {
 	const char *name;
 	uint64_t read_seq;
 	uint64_t last_write_seq;
+	uint64_t prev_frame_us; /* arrival of the previous frame, for the PSI gap predictor */
 	int idle_count;
 	uint32_t codec;
 	uint32_t width;
@@ -48,6 +49,7 @@ typedef struct {
 	uint64_t frames_sent;
 	uint64_t bytes_sent;
 	int64_t connect_time_us;
+	uint64_t last_pat_us;
 } rsr_client_t;
 
 /* ── Server state ── */
@@ -72,6 +74,7 @@ typedef struct {
 	int audio_idle;
 	uint32_t audio_codec;
 	uint32_t audio_sample_rate;
+	uint32_t audio_adts_rate; /* rate declared in ADTS (core rate for HE-AAC) */
 	uint8_t audio_ts_type;
 
 	uint8_t *frame_buf;

@@ -6,7 +6,7 @@
 # First run takes a few minutes (downloads). Subsequent runs are fast.
 #
 # Usage: ./build-standalone.sh <platform> [options]
-#   platform: t20, t21, t23, t30, t31, t32, t40, t41
+#   platform: t10, t20, t21, t23, t30, t31, t32, t33, t40, t41, a1
 #
 # Options:
 #   --no-tls       Disable TLS (no RTSPS/WebRTC)
@@ -115,7 +115,7 @@ HELIX_VERSION=05f2fb0045cc294b4e0d1a1a9747b89c22c1fea4
 SCHRIFT_VERSION=24737d2922b23df4a5692014f5ba03da0c296112
 MUSL_SHIM_VERSION=HEAD
 UCLIBC_SHIM_VERSION=HEAD
-LIBSRT_VERSION=v1.5.4
+LIBSRT_VERSION=v1.5.6
 
 # ── Parse arguments ──
 
@@ -144,7 +144,7 @@ JOBS="${JOBS:-$(nproc)}"
 
 usage() {
     echo "Usage: $0 <platform> [options]"
-    echo "  platform: t20, t21, t23, t30, t31, t32, t40, t41, a1"
+    echo "  platform: t10, t20, t21, t23, t30, t31, t32, t33, t40, t41, a1"
     echo ""
     echo "Options:"
     echo "  --no-tls       Disable TLS/WebRTC"
@@ -206,22 +206,6 @@ if [ "$OPT_CLEAN_ALL" = 1 ]; then
     exit 0
 fi
 
-[ -z "$PLATFORM" ] && usage
-
-if [ "$OPT_STATIC_VENDOR" = 1 ] && [ "$OPT_STATIC" != 1 ]; then
-    echo "ERROR: --static-vendor-libs requires --static"
-    exit 1
-fi
-
-if [ "$OPT_DEBUG" = 1 ] && [ "$OPT_RELEASE" = 1 ]; then
-    echo "ERROR: --debug and --release are mutually exclusive"
-    exit 1
-fi
-
-PLATFORM_UPPER=$(echo "$PLATFORM" | tr a-z A-Z)
-
-# ── Clean ──
-
 if [ "$OPT_CLEAN" = 1 ]; then
     make clean 2>/dev/null || true
     echo "Cleaning build artifacts (keeping downloaded deps)..."
@@ -238,6 +222,21 @@ if [ "$OPT_CLEAN" = 1 ]; then
     echo "Done."
     exit 0
 fi
+
+[ -z "$PLATFORM" ] && usage
+
+if [ "$OPT_STATIC_VENDOR" = 1 ] && [ "$OPT_STATIC" != 1 ]; then
+    echo "ERROR: --static-vendor-libs requires --static"
+    exit 1
+fi
+
+if [ "$OPT_DEBUG" = 1 ] && [ "$OPT_RELEASE" = 1 ]; then
+    echo "ERROR: --debug and --release are mutually exclusive"
+    exit 1
+fi
+
+PLATFORM_UPPER=$(echo "$PLATFORM" | tr a-z A-Z)
+
 
 # ── SDK version map ──
 
@@ -281,11 +280,15 @@ setup_toolchain() {
         *)       SOC_ARCH=xburst1 ;;
     esac
 
-    TOOLCHAIN_NAME="thingino-toolchain-${HOST_ARCH}_${SOC_ARCH}_${LIBC}_gcc15-linux-mipsel"
+    TOOLCHAIN_NAME="thingino-toolchain-${HOST_ARCH}_${SOC_ARCH}_${LIBC}_gcc16-linux-mipsel"
     TOOLCHAIN_URL="https://github.com/themactep/thingino-firmware/releases/download/toolchain-${HOST_ARCH}/${TOOLCHAIN_NAME}.tar.gz"
 
     if [ ! -d "$TOOLCHAIN_DIR" ] || [ ! -f "$TOOLCHAIN_DIR/.version_${TOOLCHAIN_NAME}" ]; then
         echo "Downloading toolchain: $TOOLCHAIN_NAME"
+        # Wipe any previous toolchain: extracting over another family's
+        # tree leaves its .version marker behind, and a later switch
+        # back would silently reuse the wrong-arch binaries.
+        rm -rf "$TOOLCHAIN_DIR"
         mkdir -p "$TOOLCHAIN_DIR"
         curl -fSL "$TOOLCHAIN_URL" | tar xz -C "$TOOLCHAIN_DIR" --strip-components=1
         touch "$TOOLCHAIN_DIR/.version_${TOOLCHAIN_NAME}"
@@ -633,7 +636,11 @@ H
 
 build_helix_aac() {
     local src="$DEPS_DIR/ESP8266Audio/src/libhelix-aac"
-    local ext=so; [ "$OPT_STATIC" = 1 ] && ext=a
+    local ext=so other=a
+    if [ "$OPT_STATIC" = 1 ]; then ext=a; other=so; fi
+    # Same trap libschrift documents below: with both variants in the
+    # sysroot the linker prefers .so and quietly defeats --static.
+    rm -f "$SYSROOT_DIR/usr/lib/libhelix-aac.$other"
     [ -f "$SYSROOT_DIR/usr/lib/libhelix-aac.$ext" ] && return
 
     echo "Building libhelix-aac..."
@@ -654,7 +661,9 @@ build_helix_aac() {
 
 build_helix_mp3() {
     local src="$DEPS_DIR/ESP8266Audio/src/libhelix-mp3"
-    local ext=so; [ "$OPT_STATIC" = 1 ] && ext=a
+    local ext=so other=a
+    if [ "$OPT_STATIC" = 1 ]; then ext=a; other=so; fi
+    rm -f "$SYSROOT_DIR/usr/lib/libhelix-mp3.$other"
     [ -f "$SYSROOT_DIR/usr/lib/libhelix-mp3.$ext" ] && return
 
     echo "Building libhelix-mp3..."
@@ -675,7 +684,12 @@ build_helix_mp3() {
 
 build_schrift() {
     local src="$DEPS_DIR/libschrift"
-    local ext=so; [ "$OPT_STATIC" = 1 ] && ext=a
+    local ext=so other=a
+    if [ "$OPT_STATIC" = 1 ]; then ext=a; other=so; fi
+    # Drop the opposite variant: the linker prefers .so when both are
+    # present, so a leftover shared build silently defeats --static and
+    # ships a daemon needing a library the image does not carry.
+    rm -f "$SYSROOT_DIR/usr/lib/libschrift.$other"
     [ -f "$SYSROOT_DIR/usr/lib/libschrift.$ext" ] && return
 
     echo "Building libschrift..."
@@ -713,7 +727,7 @@ build_live555() {
         local lib_link_opts="-shared -Wl,-soname,\$(notdir \$@) -L$SYSROOT_DIR/usr/lib"
     fi
     cat > config.raptor <<EOCFG
-COMPILE_OPTS =		\$(INCLUDES) -I. -DSOCKLEN_T=socklen_t -DNO_OPENSSL -DNO_STD_LIB -DLOCALE_NOT_USED -DALLOW_RTSP_SERVER_PORT_REUSE -Os -fPIC
+COMPILE_OPTS =		\$(INCLUDES) -I. -DSOCKLEN_T=socklen_t -DNO_OPENSSL -DNO_STD_LIB -DLOCALE_NOT_USED -DALLOW_RTSP_SERVER_PORT_REUSE -Os -fPIC -fno-strict-aliasing
 C =			c
 CPP =			cpp
 C_COMPILER =		${cc}
@@ -730,10 +744,20 @@ LIB_SUFFIX =		${lib_suffix}
 PREFIX =		/usr
 EOCFG
 
-    # Apply thingino patches (strict-aliasing fix + ONVIF backchannel)
+    # Apply the rsd-555 live555 patches. Failures are LOUD: a patch
+    # that stops applying after a live555 bump must fail the build,
+    # not silently ship a daemon without the fix. Already-applied is
+    # fine (idempotent re-runs on an existing checkout).
     chmod -R u+w .
     for p in "$SCRIPT_DIR/rsd-555/patches/"*.patch; do
-        [ -f "$p" ] && patch -p1 -N < "$p" 2>/dev/null || true
+        [ -f "$p" ] || continue
+        out=$(patch -p1 -N < "$p" 2>&1) || {
+            if ! echo "$out" | grep -q "previously applied"; then
+                echo "$out"
+                echo "FATAL: live555 patch failed: $(basename "$p")"
+                exit 1
+            fi
+        }
     done
 
     ./genMakefiles raptor
@@ -903,9 +927,10 @@ clone_repo libschrift   https://github.com/tomolt/libschrift         "$SCHRIFT_V
 [ "$OPT_RFS" = 1 ] && clone_repo media-server https://github.com/ireader/media-server      HEAD
 
 # live555 — download tarball (not a git repo); only needed for rsd-555
+LIVE555_VERSION=2026.07.23
 if [ "$OPT_RSD555" = 1 ] && [ ! -d "$DEPS_DIR/live" ]; then
-    echo "Downloading live555..."
-    curl -sL https://github.com/gtxaspec/live555-release-mirror/releases/download/v2026.04.22/live.2026.04.22.tar.gz | tar xz -C "$DEPS_DIR"
+    echo "Downloading live555 $LIVE555_VERSION..."
+    curl -sL "https://github.com/gtxaspec/live555-release-mirror/releases/download/v$LIVE555_VERSION/live.$LIVE555_VERSION.tar.gz" | tar xz -C "$DEPS_DIR"
 fi
 
 [ "$OPT_TLS" = 1 ] && clone_repo mbedtls https://github.com/Mbed-TLS/mbedtls "$MBEDTLS_VERSION" submodules
@@ -948,6 +973,14 @@ fi
 
 # Build raptor
 echo ""
+# Daemon objects must not outlive the dependency set they were
+# compiled against: librss_common is rebuilt every run, and linking
+# stale LTO objects against a fresh lib dies in lto1 with
+# "resolution sub id not in object file". ccache makes the
+# recompile cheap; determinism is worth more than incrementality
+# in a standalone build.
+find "$SCRIPT_DIR" -name '*.o' -not -path "$DEPS_DIR/*" -delete
+
 echo "Building raptor daemons..."
 
 COMPY_CFLAGS="-I$SYSROOT_DIR/usr/include"
@@ -987,6 +1020,11 @@ else
 fi
 [ "$OPT_RSD555" = 1 ] || LINK_LIVE555=""
 
+# --static-stdcxx must reach the daemon links too (rsr is C++ via
+# libsrt); the cmake flag above only covers libsrt's own artifacts.
+EXTRA_LDFLAGS=""
+[ "$OPT_STATIC_STDCXX" = 1 ] && EXTRA_LDFLAGS="-static-libstdc++ -static-libgcc"
+
 make -j"$JOBS" \
     PLATFORM="$PLATFORM_UPPER" \
     CROSS_COMPILE="$CROSS_COMPILE" \
@@ -1004,6 +1042,7 @@ make -j"$JOBS" \
     LIB_COMPY="$LINK_COMPY" \
     LIB_COMPY_FILE="$SYSROOT_DIR/usr/lib/libcompy.a" \
     COMPY_CFLAGS="$COMPY_CFLAGS" \
+    EXTRA_LDFLAGS="$EXTRA_LDFLAGS" \
     LIVE555_SYSROOT="$SYSROOT_DIR" \
     ${LINK_LIVE555:+LIVE555_LIBS="$LINK_LIVE555"} \
     EXTRA_CFLAGS="-I$SYSROOT_DIR/usr/include $([ "$OPT_RELEASE" = 1 ] && echo "-Oz -DNDEBUG")" \

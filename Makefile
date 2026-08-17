@@ -72,6 +72,10 @@ ifeq ($(AUDIO_EFFECTS),1)
 CFLAGS += -DRAPTOR_AUDIO_EFFECTS
 endif
 
+ifeq ($(V4L2_OPENIMP),1)
+CFLAGS += -DRAPTOR_V4L2_OPENIMP
+endif
+
 ifeq ($(AAC),1)
 CFLAGS += -DRAPTOR_AAC
 LDFLAGS_AAC_ENC := -lfaac
@@ -127,13 +131,21 @@ LIB_COMPY  ?= $(LIB_COMPY_FILE)
 
 # TLS helper (compiled separately, only linked by daemons that need it).
 # Source is in raptor-common (standalone) or sysroot (buildroot).
+# Gated on TLS=1: without mbedtls in the sysroot the compile fails,
+# and rhd builds HTTP-only (its sources guard on RSS_HAS_TLS).
+ifeq ($(TLS),1)
 RSS_TLS_SRC := $(firstword $(wildcard $(CURDIR)/$(COMMON_DIR)/src/rss_tls.c) \
                            $(wildcard $(SYSROOT)/usr/share/raptor-common/rss_tls.c))
 RSS_TLS_OBJ := $(CURDIR)/rss_tls.o
+RSS_TLS_CFLAGS := -DRSS_HAS_TLS
 ifneq ($(RSS_TLS_SRC),)
 $(RSS_TLS_OBJ): $(RSS_TLS_SRC)
 	@echo "  CC      rss_tls.c"
 	$(Q)$(CC) $(CFLAGS) -c $< -o $@
+endif
+else
+RSS_TLS_OBJ :=
+RSS_TLS_CFLAGS :=
 endif
 
 # Sysroot for finding shared libs (set by Buildroot or manually)
@@ -179,11 +191,12 @@ LDFLAGS     := $(LDFLAGS_SYSROOT) -lpthread -lrt -latomic
 
 # MIPS page size: Ingenic SoCs use 4KB pages but the toolchain defaults to
 # 64KB max-page-size. Mismatched alignment causes SIGBUS on musl/uclibc.
-LDFLAGS_HAL += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--as-needed -Wl,--enable-new-dtags -Wl,-rpath,/usr/lib $(if $(DEBUG),,-flto)
-LDFLAGS     += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--as-needed -Wl,--enable-new-dtags -Wl,-rpath,/usr/lib $(if $(DEBUG),,-flto)
+LDFLAGS_HAL += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--as-needed -Wl,--enable-new-dtags,-rpath,/usr/lib $(if $(DEBUG),,-flto)
+LDFLAGS     += -Wl,-z,max-page-size=0x1000 -Wl,--gc-sections -Wl,--as-needed -Wl,--enable-new-dtags,-rpath,/usr/lib $(if $(DEBUG),,-flto)
 # rpath-link for local builds (finding .so at link time)
 LDFLAGS_HAL += -Wl,-rpath-link,$(CURDIR)/$(IPC_DIR) -Wl,-rpath-link,$(CURDIR)/$(COMMON_DIR)
 LDFLAGS     += -Wl,-rpath-link,$(CURDIR)/$(IPC_DIR) -Wl,-rpath-link,$(CURDIR)/$(COMMON_DIR)
+LDFLAGS     += $(EXTRA_LDFLAGS)
 EXTRA_LDFLAGS ?=
 LDFLAGS_HAL += $(EXTRA_LDFLAGS)
 LDFLAGS     += $(EXTRA_LDFLAGS)
@@ -214,87 +227,126 @@ phase1: libs rvd ringdump raptorctl
 
 libs: $(LIB_HAL_VIDEO_FILE) $(LIB_HAL_AUDIO_FILE) $(LIB_IPC_FILE) $(LIB_COMMON_FILE)
 
-$(LIB_HAL_VIDEO_FILE) $(LIB_HAL_AUDIO_FILE):
+# The sibling libraries are built by sub-makes, reached through a phony
+# target rather than by a rule on the library files themselves.
+#
+# A rule whose target is the library and which carries no prerequisites runs
+# only when the file is missing, so edits to a sibling's sources never reach
+# the daemons here. Only the sub-make knows what its own library depends on,
+# and a phony prerequisite is what hands it that decision on every build.
+#
+# One phony target per sibling, not one per library file: make enters a phony
+# target once per run however many targets depend on it, so the raptor-hal
+# sub-make cannot run twice concurrently under -j for its two archives.
+#
+# Each block is guarded on its sibling being present, because these rules
+# describe a developer checkout, where raptor-hal, raptor-ipc and raptor-common
+# sit next to this tree. A packaged build has no siblings -- each library comes
+# from its own package through LIB_*_FILE pointing into the sysroot, where the
+# file already exists and nothing here should try to enter a directory that is
+# not there. Guarded per library rather than once for all three, because a
+# mixture is legal: bisecting one library while the other two come from
+# staging.
+ifneq ($(wildcard $(HAL_DIR)/Makefile),)
+.PHONY: build-raptor-hal
+build-raptor-hal:
 	@echo "  BUILD   raptor-hal"
 	$(Q)$(MAKE) -C $(HAL_DIR) PLATFORM=$(PLATFORM) CROSS_COMPILE=$(CROSS_COMPILE) \
-		$(if $(DEBUG),DEBUG=1,)
+		$(if $(DEBUG),DEBUG=1,) \
+		$(if $(filter 1,$(V4L2_OPENIMP)),V4L2_OPENIMP=1,)
 
-$(LIB_IPC_FILE):
+$(LIB_HAL_VIDEO_FILE) $(LIB_HAL_AUDIO_FILE): build-raptor-hal
+	@:
+endif
+
+ifneq ($(wildcard $(IPC_DIR)/Makefile),)
+.PHONY: build-raptor-ipc
+build-raptor-ipc:
 	@echo "  BUILD   raptor-ipc"
 	$(Q)$(MAKE) -C $(IPC_DIR) CC="$(CC)"
 
-$(LIB_COMMON_FILE):
+$(LIB_IPC_FILE): build-raptor-ipc
+	@:
+endif
+
+ifneq ($(wildcard $(COMMON_DIR)/Makefile),)
+.PHONY: build-raptor-common
+build-raptor-common:
 	@echo "  BUILD   raptor-common"
 	$(Q)$(MAKE) -C $(COMMON_DIR) CC="$(CC)"
+
+$(LIB_COMMON_FILE): build-raptor-common
+	@:
+endif
 
 # -- Daemons --
 
 rvd: $(LIB_HAL_VIDEO_FILE) $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rvd"
 	$(Q)$(MAKE) -C rvd CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_HAL_VIDEO) $(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_HAL_VIDEO) $(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS_HAL)" Q="$(Q)"
 
 rsd: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(LIB_COMPY_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rsd"
 	$(Q)$(MAKE) -C rsd CC="$(CC)" CFLAGS="$(CFLAGS) $(COMPY_CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(LIB_COMPY) $(RSS_BUILD_LIBS)" \
-		LDFLAGS="$(LDFLAGS) $(LDFLAGS_TLS)" Q="$(Q)"
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(LIB_COMPY) $(RSS_BUILD_LIBS)" \
+		LDFLAGS="$(LDFLAGS) $(LDFLAGS_TLS) $(LDFLAGS_OPUS) $(LDFLAGS_AAC_DEC)" Q="$(Q)"
 
 rsd-555: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rsd-555"
 	$(Q)$(MAKE) -C rsd-555 CC="$(CC)" CXX="$(CROSS_COMPILE)g++" CFLAGS="$(CFLAGS)" \
 		LIVE555_INC="$(LIVE555_INC)" \
 		LIVE555_LIBS="$(LIVE555_LIBS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS)" LINK_STDCXX="$(LINK_STDCXX)" Q="$(Q)"
 
 rad: $(LIB_HAL_AUDIO_FILE) $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rad"
 	$(Q)$(MAKE) -C rad CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_HAL_AUDIO) $(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_HAL_AUDIO) $(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS_HAL) $(LDFLAGS_AAC_ENC) $(LDFLAGS_OPUS)" Q="$(Q)"
 
 rhd: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_TLS_OBJ) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rhd"
-	$(Q)$(MAKE) -C rhd CC="$(CC)" CFLAGS="$(CFLAGS) -DRSS_HAS_TLS" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_TLS_OBJ) $(RSS_BUILD_LIBS)" \
+	$(Q)$(MAKE) -C rhd CC="$(CC)" CFLAGS="$(CFLAGS) $(RSS_TLS_CFLAGS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_TLS_OBJ) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS) $(LDFLAGS_TLS)" Q="$(Q)"
 
 rod: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rod"
 	$(Q)$(MAKE) -C rod CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) -lschrift $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) -lschrift $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS)" Q="$(Q)"
 
 ric: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   ric"
 	$(Q)$(MAKE) -C ric CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS) -ldl" Q="$(Q)"
 
 rmr: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rmr"
 	$(Q)$(MAKE) -C rmr CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS)" Q="$(Q)"
 
 rmd: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rmd"
 	$(Q)$(MAKE) -C rmd CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS)" Q="$(Q)"
 
 rwd: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(LIB_COMPY_FILE) $(RSS_TLS_OBJ) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rwd"
 	$(Q)$(MAKE) -C rwd CC="$(CC)" CFLAGS="$(CFLAGS) $(COMPY_CFLAGS) -DMBEDTLS_ALLOW_PRIVATE_ACCESS -DRSS_HAS_TLS" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(LIB_COMPY) $(RSS_TLS_OBJ) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(LIB_COMPY) $(RSS_TLS_OBJ) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS) $(LDFLAGS_TLS) $(LDFLAGS_OPUS) $(LDFLAGS_AAC_DEC)" WEBTORRENT=$(WEBTORRENT) Q="$(Q)"
 
 rwc: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rwc"
 	$(Q)$(MAKE) -C rwc CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS)" Q="$(Q)"
 
 LIBMOV_DIR := $(CURDIR)/.deps/media-server/libmov
@@ -303,7 +355,7 @@ rfs: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rfs"
 	$(Q)$(MAKE) -C rfs CC="$(CC)" \
 		CFLAGS="$(CFLAGS) -I$(CURDIR)/rad -I$(LIBMOV_DIR)/include -I$(LIBMOV_DIR)/source" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS) $(LDFLAGS_AAC_ENC) $(LDFLAGS_OPUS) $(LDFLAGS_MP3) $(LDFLAGS_AAC_DEC)" \
 		RAD_DIR="$(CURDIR)/rad" LIBMOV_DIR="$(LIBMOV_DIR)" Q="$(Q)"
 
@@ -318,11 +370,11 @@ RSP_CFLAGS += -DRAPTOR_OPUS
 RSP_LDFLAGS += $(LDFLAGS_OPUS)
 endif
 
-rsp: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_TLS_OBJ) $(RSS_BUILD_OBJ)
+rsp: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(LIB_COMPY_FILE) $(RSS_TLS_OBJ) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rsp"
-	$(Q)$(MAKE) -C rsp CC="$(CC)" CFLAGS="$(CFLAGS) $(RSP_CFLAGS) -I$(CURDIR)/rmr" \
+	$(Q)$(MAKE) -C rsp CC="$(CC)" CFLAGS="$(CFLAGS) $(RSP_CFLAGS) $(COMPY_CFLAGS) -I$(CURDIR)/rmr" \
 		RMR_DIR="$(CURDIR)/rmr" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_TLS_OBJ) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(LIB_COMPY) $(RSS_TLS_OBJ) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS) $(LDFLAGS_TLS) $(RSP_LDFLAGS)" Q="$(Q)"
 
 LDFLAGS_SRT ?= -lsrt $(LINK_STDCXX) -latomic $(LDFLAGS_TLS)
@@ -331,7 +383,7 @@ CFLAGS_SRT  ?= $(if $(SYSROOT),-I$(SYSROOT)/usr/include)
 rsr: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rsr"
 	$(Q)$(MAKE) -C rsr CC="$(CC)" CFLAGS="$(CFLAGS) $(CFLAGS_SRT)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS) $(LDFLAGS_SRT)" Q="$(Q)"
 
 # -- Tools --
@@ -339,19 +391,19 @@ rsr: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 raptorctl: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   raptorctl"
 	$(Q)$(MAKE) -C raptorctl CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS)" Q="$(Q)"
 
 ringdump: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   ringdump"
 	$(Q)$(MAKE) -C ringdump CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS)" Q="$(Q)"
 
 rac: $(LIB_IPC_FILE) $(LIB_COMMON_FILE) $(RSS_BUILD_OBJ)
 	@echo "  BUILD   rac"
 	$(Q)$(MAKE) -C rac CC="$(CC)" CFLAGS="$(CFLAGS)" \
-		LIBS="$(LIB_IPC) $(LIB_COMMON) $(RSS_BUILD_LIBS)" \
+		LIBS="$(LIB_COMMON) $(LIB_IPC) $(RSS_BUILD_LIBS)" \
 		LDFLAGS="$(LDFLAGS) $(LDFLAGS_MP3) $(LDFLAGS_AAC_DEC) $(LDFLAGS_OPUS)" Q="$(Q)"
 
 rlatency:

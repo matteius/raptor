@@ -13,6 +13,10 @@
 #include <limits.h>
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <glob.h>
+#include <sys/stat.h>
 
 #include "rvd.h"
 
@@ -73,6 +77,91 @@ static int fmt_hal_result(char *buf, int bufsz, int ret)
 	}
 }
 
+/*
+ * Runtime sensor-rate change with coherent encoder follow-through.
+ * Sensor timing is the half that buys exposure headroom (frame period
+ * bounds integration time); it moves first, and a driver rejection
+ * aborts the whole change so nothing is left half-applied. Encoder
+ * rate control then budgets bits per frame from its fps parameter and
+ * counts GOP in frames, so both follow -- otherwise half the target
+ * bitrate evaporates and the IDR interval silently stretches in
+ * seconds, which rmr's segment alignment and the keyframe-first join
+ * depend on. A stream configured slower than the sensor (decimated
+ * substream) keeps its own rate. Nothing here touches enc_cfg or the
+ * config: the override is transient by design, and applying the base
+ * rate through this same path lands every stream back on its
+ * configured values.
+ *
+ * Caveat: a stream restart (set-codec/set-resolution) rebuilds its
+ * encoder from enc_cfg, so a restarted stream runs its configured
+ * rate until the next override call -- benign (RC over-budgets), and
+ * ric re-asserts on mode edges.
+ */
+static int rvd_apply_sensor_fps(rvd_state_t *st, uint32_t num, uint32_t den)
+{
+	if (!st || num < 1 || den < 1 || num / den < 1 || num / den > 120)
+		return RSS_ERR_INVAL;
+
+	int ret;
+	if (st->sensor_count > 1 && st->ops->isp_set_sensor_fps_n) {
+		ret = 0;
+		for (int s = 0; s < st->sensor_count && ret == 0; s++)
+			ret = RSS_HAL_CALL(st->ops, isp_set_sensor_fps_n, st->hal_ctx, s, num, den);
+	} else {
+		ret = RSS_HAL_CALL(st->ops, isp_set_sensor_fps, st->hal_ctx, num, den);
+	}
+	if (ret != 0)
+		return ret;
+
+	uint32_t sensor_fps = (num + den / 2) / den;
+	for (int i = 0; i < st->stream_count; i++) {
+		rvd_stream_t *s = &st->streams[i];
+		if (!s->enabled || s->is_jpeg)
+			continue;
+		uint32_t cfg_den = s->enc_cfg.fps_den ? s->enc_cfg.fps_den : 1;
+		uint32_t cfg_fps = s->enc_cfg.fps_num / cfg_den;
+		if (!cfg_fps)
+			continue;
+		bool limited = sensor_fps < cfg_fps;
+		uint32_t eff_num = limited ? num : s->enc_cfg.fps_num;
+		uint32_t eff_den = limited ? den : cfg_den;
+		uint32_t eff_fps = limited ? sensor_fps : cfg_fps;
+		if (RSS_HAL_CALL(st->ops, enc_set_fps, st->hal_ctx, s->chn, eff_num, eff_den) != 0)
+			RSS_WARN("stream %d: encoder rate %u fps not applied", i, eff_fps);
+		if (s->enc_cfg.gop_length > 0) {
+			uint32_t gop = (s->enc_cfg.gop_length * eff_fps + cfg_fps / 2) / cfg_fps;
+			if (gop < 1)
+				gop = 1;
+			if (RSS_HAL_CALL(st->ops, enc_set_gop, st->hal_ctx, s->chn, gop) != 0)
+				RSS_WARN("stream %d: gop %u not applied", i, gop);
+		}
+		s->active_fps_num = limited ? eff_num : 0;
+		s->active_fps_den = limited ? eff_den : 0;
+		rvd_stream_publish_info(st, i);
+	}
+	return 0;
+}
+
+/*
+ * Which config key persists this encoder setting for this stream, or NULL if
+ * this stream has nowhere to write it.
+ *
+ * A JPEG snapshot channel shares its parent video stream's section but not its
+ * keys: what it takes from there is jpeg_-prefixed. The H.26x rate-control keys
+ * have no snapshot counterpart at all, so those changes apply to the running
+ * encoder and are deliberately not written down -- persisting them under the
+ * parent's plain key would retune the video stream at the next boot, from a
+ * command that never mentioned it.
+ */
+static const char *rvd_persist_key(const rvd_stream_t *s, const char *key)
+{
+	if (!s->is_jpeg)
+		return key;
+	if (strcmp(key, "fps") == 0)
+		return "jpeg_fps";
+	return NULL;
+}
+
 /* ── Encoder commands ── */
 
 static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t *st, char *resp,
@@ -81,13 +170,27 @@ static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t
 	int chn, val, val2;
 
 	if (strcmp(cmd, "request-idr") == 0) {
+		/* Thread contract: this runs on the ctrl thread while each
+		 * encoder thread sits in poll/get_frame on the same channel.
+		 * Serialization is delegated to the codec command layer
+		 * beneath -- the vendor SDK by long production tolerance,
+		 * the AL codec mailbox on the OpenIMP bridge -- so neither
+		 * branch takes a userspace lock. If IDR anomalies ever
+		 * surface, route the request through the encoder thread
+		 * with an atomic flag (the pending_pipeline_reinit
+		 * pattern) instead of adding locking here. */
 		int target = -1;
 		rss_json_get_int(cmd_json, "channel", &target);
 		for (int i = 0; i < st->stream_count; i++) {
 			if (target >= 0 && i != target)
 				continue;
+			/* Same reason the frame loop skips them: every MJPEG
+			 * frame is already intra, so there is no keyframe to
+			 * ask for, and an encoder may reject the request. */
+			if (st->streams[i].is_jpeg)
+				continue;
 			if (st->v4l2_backend)
-				rss_v4l2_h264_request_idr(st->v4l2);
+				rvd_v4l2_h264_request_idr(st->v4l2);
 			else
 				RSS_HAL_CALL(st->ops, enc_request_idr, st->hal_ctx,
 					     st->streams[i].chn);
@@ -124,10 +227,12 @@ static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t
 				bitrate = (uint32_t)br;
 			int ret = RSS_HAL_CALL(st->ops, enc_set_rc_mode, st->hal_ctx,
 					       st->streams[chn].chn, mode, bitrate);
+			const char *key = rvd_persist_key(&st->streams[chn], "rc_mode");
 			if (ret == 0) {
 				st->streams[chn].enc_cfg.rc_mode = mode;
-				rss_config_set_str(st->cfg, st->streams[chn].cfg_sect, "rc_mode",
-						   mode_str);
+				if (key)
+					rss_config_set_str(st->cfg, st->streams[chn].cfg_sect, key,
+							   mode_str);
 			}
 			cJSON *r = cJSON_CreateObject();
 			cJSON_AddStringToObject(r, "status", ret == 0 ? "ok" : "error");
@@ -144,10 +249,12 @@ static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t
 		    chn < st->stream_count) {
 			int ret = RSS_HAL_CALL(st->ops, enc_set_bitrate, st->hal_ctx,
 					       st->streams[chn].chn, val);
+			const char *key = rvd_persist_key(&st->streams[chn], "bitrate");
 			if (ret == 0) {
 				st->streams[chn].enc_cfg.bitrate = val;
-				rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, "bitrate",
-						   val);
+				if (key)
+					rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, key,
+							   val);
 			}
 			return fmt_hal_result(resp, resp_size, ret);
 		}
@@ -160,9 +267,12 @@ static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t
 		    chn < st->stream_count) {
 			int ret = RSS_HAL_CALL(st->ops, enc_set_gop, st->hal_ctx,
 					       st->streams[chn].chn, val);
+			const char *key = rvd_persist_key(&st->streams[chn], "gop");
 			if (ret == 0) {
 				st->streams[chn].enc_cfg.gop_length = val;
-				rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, "gop", val);
+				if (key)
+					rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, key,
+							   val);
 			}
 			return fmt_hal_result(resp, resp_size, ret);
 		}
@@ -175,9 +285,18 @@ static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t
 		    chn < st->stream_count) {
 			int ret = RSS_HAL_CALL(st->ops, enc_set_fps, st->hal_ctx,
 					       st->streams[chn].chn, val, 1);
+			const char *key = rvd_persist_key(&st->streams[chn], "fps");
 			if (ret == 0) {
 				st->streams[chn].enc_cfg.fps_num = val;
-				rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, "fps", val);
+				st->streams[chn].enc_cfg.fps_den = 1;
+				/* An explicit configured rate supersedes any
+				 * transient sensor-rate override on this stream. */
+				st->streams[chn].active_fps_num = 0;
+				st->streams[chn].active_fps_den = 0;
+				if (key)
+					rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, key,
+							   val);
+				rvd_stream_publish_info(st, chn);
 			}
 			return fmt_hal_result(resp, resp_size, ret);
 		}
@@ -191,13 +310,17 @@ static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t
 		    chn < st->stream_count) {
 			int ret = RSS_HAL_CALL(st->ops, enc_set_qp_bounds, st->hal_ctx,
 					       st->streams[chn].chn, val, val2);
+			const char *min_key = rvd_persist_key(&st->streams[chn], "min_qp");
+			const char *max_key = rvd_persist_key(&st->streams[chn], "max_qp");
 			if (ret == 0) {
 				st->streams[chn].enc_cfg.min_qp = val;
 				st->streams[chn].enc_cfg.max_qp = val2;
-				rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, "min_qp",
-						   val);
-				rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, "max_qp",
-						   val2);
+				if (min_key)
+					rss_config_set_int(st->cfg, st->streams[chn].cfg_sect,
+							   min_key, val);
+				if (max_key)
+					rss_config_set_int(st->cfg, st->streams[chn].cfg_sect,
+							   max_key, val2);
 			}
 			return fmt_hal_result(resp, resp_size, ret);
 		}
@@ -236,6 +359,59 @@ static int handle_encoder_cmd(const char *cmd, const char *cmd_json, rvd_state_t
 			return rss_ctrl_resp_json(resp, resp_size, r);
 		}
 		return rss_ctrl_resp_error(resp, resp_size, "need channel");
+	}
+
+	/* Transient sensor-rate override: sensor timing + encoder RC +
+	 * GOP move together (rvd_apply_sensor_fps above), nothing is
+	 * persisted, and value 0 restores the rate captured at pipeline
+	 * init. The exposure ceiling is the point: frame period bounds
+	 * integration time, so ric drops the rate at night for photons
+	 * instead of gain. */
+	if (strcmp(cmd, "set-sensor-fps") == 0) {
+		if (rss_json_get_int(cmd_json, "value", &val) != 0 || val < 0)
+			return rss_ctrl_resp_error(resp, resp_size, "need value (fps, 0=base)");
+		uint32_t num = (uint32_t)val, den = 1;
+		if (val == 0) {
+			if (!st->sensor_base_fps_num)
+				return rss_ctrl_resp_error(resp, resp_size,
+							   "base rate unknown on this backend");
+			num = st->sensor_base_fps_num;
+			den = st->sensor_base_fps_den;
+		}
+		int ret = rvd_apply_sensor_fps(st, num, den);
+		if (ret != 0)
+			return fmt_hal_result(resp, resp_size, ret);
+		cJSON *r = cJSON_CreateObject();
+		cJSON_AddStringToObject(r, "status", "ok");
+		cJSON_AddNumberToObject(r, "fps_num", (double)num);
+		cJSON_AddNumberToObject(r, "fps_den", (double)den);
+		cJSON *streams = cJSON_AddArrayToObject(r, "streams");
+		for (int i = 0; i < st->stream_count; i++) {
+			rvd_stream_t *s = &st->streams[i];
+			if (!s->enabled || s->is_jpeg)
+				continue;
+			cJSON *item = cJSON_CreateObject();
+			cJSON_AddNumberToObject(item, "channel", (double)i);
+			uint32_t fn = s->active_fps_num ? s->active_fps_num : s->enc_cfg.fps_num;
+			uint32_t fd = s->active_fps_num ? s->active_fps_den : s->enc_cfg.fps_den;
+			cJSON_AddNumberToObject(item, "fps", (double)(fd ? fn / fd : fn));
+			cJSON_AddItemToArray(streams, item);
+		}
+		return rss_ctrl_resp_json(resp, resp_size, r);
+	}
+
+	if (strcmp(cmd, "get-sensor-fps") == 0) {
+		uint32_t num = 0, den = 0;
+		int ret = RSS_HAL_CALL(st->ops, isp_get_sensor_fps, st->hal_ctx, &num, &den);
+		if (ret != 0 && !st->sensor_base_fps_num)
+			return fmt_hal_result(resp, resp_size, ret);
+		cJSON *r = cJSON_CreateObject();
+		cJSON_AddStringToObject(r, "status", "ok");
+		cJSON_AddNumberToObject(r, "fps_num", (double)num);
+		cJSON_AddNumberToObject(r, "fps_den", (double)den);
+		cJSON_AddNumberToObject(r, "base_fps_num", (double)st->sensor_base_fps_num);
+		cJSON_AddNumberToObject(r, "base_fps_den", (double)st->sensor_base_fps_den);
+		return rss_ctrl_resp_json(resp, resp_size, r);
 	}
 
 	if (strcmp(cmd, "get-gop") == 0) {
@@ -1297,6 +1473,121 @@ static int do_stream_restart(rvd_state_t *st, int chn, char *resp, int resp_size
 }
 
 /* Returns 0 if valid, or positive response length (error already written) */
+/* ── save bayer helpers ── */
+
+#if !defined(PLATFORM_T20)
+/* Kernel road: the tx-isp VIC debug node dumps one pre-ISP sensor
+ * frame and writes /tmp/snap*.raw. Needs a streaming pipeline (VIC
+ * active). Only T30 needs the ispmem= bootarg reserve; see the
+ * per-platform cmd_str notes below. Arg differs by generation:
+ * gen3 takes the VI number, 3.10 a count. */
+static int bayer_snapraw_grab(char *found, size_t found_sz)
+{
+	glob_t g;
+	if (glob("/tmp/snap*.raw", 0, NULL, &g) == 0) {
+		for (size_t i = 0; i < g.gl_pathc; i++)
+			unlink(g.gl_pathv[i]);
+		globfree(&g);
+	}
+
+	int fd = open("/proc/jz/isp/isp-w02", O_WRONLY);
+	if (fd < 0)
+		return -ENOENT;
+#if defined(PLATFORM_T40) || defined(PLATFORM_T41)
+	static const char cmd_str[] = "snapraw 0";
+#elif defined(PLATFORM_T30)
+	/* T30's VIC only implements snapraw, and its buffer comes from
+	 * the ispmem= private region (tx-isp-videobuf.c): the one SoC
+	 * that needs the carve (sensor w*h*2 bytes, e.g. 6M for 4MP). */
+	static const char cmd_str[] = "snapraw 1";
+#else
+	/* saveraw self-buffers, so no ispmem= reserve is needed (snapraw
+	 * on these blobs DMAs into ispmem and silently does nothing
+	 * without it). */
+	static const char cmd_str[] = "saveraw 1";
+#endif
+	ssize_t wr = write(fd, cmd_str, sizeof(cmd_str) - 1);
+	close(fd);
+	if (wr < 0)
+		return -EPERM;
+
+	long last = -1;
+	for (int ms = 0; ms < 3000; ms += 200) {
+		usleep(200 * 1000);
+		if (glob("/tmp/snap*.raw", 0, NULL, &g) != 0)
+			continue;
+		struct stat sb;
+		int ok = (stat(g.gl_pathv[0], &sb) == 0 && sb.st_size > 0);
+		if (ok && sb.st_size == last) {
+			rss_strlcpy(found, g.gl_pathv[0], found_sz);
+			globfree(&g);
+			return 0;
+		}
+		last = ok ? sb.st_size : -1;
+		globfree(&g);
+	}
+	return -ETIMEDOUT;
+}
+
+/* Sensor native dims from the ISP debug node (bayer frames are
+ * sensor-sized, not stream-sized). Best effort. */
+static void bayer_sensor_dims(int *w, int *h)
+{
+	*w = 0;
+	*h = 0;
+	FILE *f = fopen("/proc/jz/isp/isp-m0", "r");
+	if (!f)
+		return;
+	char line[160];
+	while (fgets(line, sizeof(line), f)) {
+		int v;
+		if (sscanf(line, " SENSOR OUTPUT WIDTH : %d", &v) == 1)
+			*w = v;
+		else if (sscanf(line, " SENSOR OUTPUT HEIGHT : %d", &v) == 1)
+			*h = v;
+	}
+	fclose(f);
+}
+#endif
+
+#if !defined(PLATFORM_T20)
+/* Move a produced file to the requested path; rename first, copy on
+ * cross-device (targets on SD/NFS). */
+static int bayer_move(const char *src, const char *dst)
+{
+	if (rename(src, dst) == 0)
+		return 0;
+	if (errno != EXDEV)
+		return -1;
+	int in = open(src, O_RDONLY);
+	if (in < 0)
+		return -1;
+	int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (out < 0) {
+		close(in);
+		return -1;
+	}
+	char buf[65536];
+	ssize_t n;
+	int ret = 0;
+	while ((n = read(in, buf, sizeof(buf))) > 0) {
+		if (write(out, buf, n) != n) {
+			ret = -1;
+			break;
+		}
+	}
+	if (n < 0)
+		ret = -1;
+	close(in);
+	close(out);
+	if (ret == 0)
+		unlink(src);
+	else
+		unlink(dst);
+	return ret;
+}
+#endif
+
 static int validate_video_channel(rvd_state_t *st, const char *cmd_json, int *out_chn, char *resp,
 				  int resp_size)
 {
@@ -1518,6 +1809,288 @@ static int handle_pipeline_cmd(const char *cmd, const char *cmd_json, rvd_state_
 		rss_config_set_int(st->cfg, st->streams[chn].cfg_sect, "height", h);
 		RSS_INFO("set-resolution: channel %d → %dx%d complete", chn, w, h);
 		return rss_ctrl_resp_ok(resp, resp_size);
+	}
+
+	if (strcmp(cmd, "save") == 0) {
+		char format[16] = "";
+		char file[256] = "";
+		int jpeg_ch = 0;
+		rss_json_get_str(cmd_json, "format", format, sizeof(format));
+		rss_json_get_str(cmd_json, "file", file, sizeof(file));
+		rss_json_get_int(cmd_json, "channel", &jpeg_ch);
+		if (!format[0] || !file[0])
+			return rss_ctrl_resp_error(resp, resp_size, "need format and file");
+		bool want_raw = (strcmp(format, "raw") == 0);
+		bool want_bayer = (strcmp(format, "bayer") == 0);
+		if (strcmp(format, "jpeg") != 0 && !want_raw && !want_bayer)
+			return rss_ctrl_resp_error(
+				resp, resp_size,
+				"unsupported format (supported: jpeg, raw, bayer)");
+		if (file[0] != '/')
+			return rss_ctrl_resp_error(resp, resp_size,
+						   "file must be an absolute path");
+
+		if (want_bayer) {
+#if defined(PLATFORM_T20)
+			/* T20 has no kernel raw dump; its old-SDK libimp honors
+			 * PIX_FMT_RAW on fs channel 0 only, so flip the main
+			 * stream's framesource to RAW around one grab. Brief
+			 * main-stream interruption, set-resolution pattern. */
+			int chn = 0;
+			if (chn >= st->stream_count || !atomic_load(&st->stream_active[chn]))
+				return rss_ctrl_resp_error(resp, resp_size,
+							   "main stream not active");
+			int jpeg = find_jpeg_for_video_ctrl(st, chn);
+			bool has_ivs = (st->streams[chn].fs_chn == st->ivs_fs_chn &&
+					atomic_load(&st->ivs_active));
+			if (has_ivs)
+				ivs_thread_stop(st);
+			if (jpeg >= 0)
+				rvd_stream_stop(st, jpeg);
+			rvd_stream_stop(st, chn);
+			if (jpeg >= 0)
+				rvd_stream_deinit(st, jpeg);
+			rvd_stream_deinit(st, chn);
+
+			/* Full destroy/recreate on both sides of the pixfmt
+			 * flip: reconfiguring a created channel between NV12
+			 * and RAW leaves the old-SDK buffer pool sized for the
+			 * wrong format and corrupts the restored stream. */
+			rss_pixfmt_t old_fmt = st->streams[chn].fs_cfg.pixfmt;
+			RSS_HAL_CALL(st->ops, fs_destroy_channel, st->hal_ctx,
+				     st->streams[chn].fs_chn);
+			st->streams[chn].fs_cfg.pixfmt = RSS_PIXFMT_RAW;
+			RSS_HAL_CALL(st->ops, fs_create_channel, st->hal_ctx,
+				     st->streams[chn].fs_chn, &st->streams[chn].fs_cfg);
+			RSS_HAL_CALL(st->ops, fs_enable_channel, st->hal_ctx,
+				     st->streams[chn].fs_chn);
+			RSS_HAL_CALL(st->ops, fs_set_frame_depth, st->hal_ctx,
+				     st->streams[chn].fs_chn, 1);
+
+			rss_frame_info_t info = {0};
+			void *frame = NULL;
+			int gret = RSS_HAL_CALL(st->ops, fs_get_frame, st->hal_ctx,
+						st->streams[chn].fs_chn, &frame, &info);
+			int wret = -1;
+			if (gret == 0 && frame && info.virt_addr && info.size) {
+				char tmp[272];
+				snprintf(tmp, sizeof(tmp), "%s.tmp", file);
+				int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+				if (fd >= 0) {
+					if (write(fd, info.virt_addr, info.size) ==
+					    (ssize_t)info.size)
+						wret = 0;
+					close(fd);
+				}
+				if (wret == 0 && rename(tmp, file) != 0)
+					wret = -1;
+				if (wret != 0)
+					unlink(tmp);
+				RSS_HAL_CALL(st->ops, fs_release_frame, st->hal_ctx,
+					     st->streams[chn].fs_chn, frame);
+			}
+
+			RSS_HAL_CALL(st->ops, fs_set_frame_depth, st->hal_ctx,
+				     st->streams[chn].fs_chn, 0);
+			RSS_HAL_CALL(st->ops, fs_disable_channel, st->hal_ctx,
+				     st->streams[chn].fs_chn);
+			st->streams[chn].fs_cfg.pixfmt = old_fmt;
+
+			/* The old-SDK VBM pool does not survive an in-place
+			 * RAW cycle: any surgical restore leaves the encoder
+			 * emitting truncated NALs. Schedule a full pipeline
+			 * reinit; the frame loop runs it after this response
+			 * is flushed (a few seconds of stream outage). */
+			atomic_store(&st->pending_pipeline_reinit, true);
+
+			if (gret != 0 || wret != 0)
+				return rss_ctrl_resp_error(resp, resp_size,
+							   gret != 0 ? "raw grab failed"
+								     : strerror(errno));
+
+			RSS_INFO("save: %s (%u bytes, bayer %ux%u)", file, info.size, info.width,
+				 info.height);
+			cJSON *r = cJSON_CreateObject();
+			if (!r)
+				return rss_ctrl_resp_error(resp, resp_size, "out of memory");
+			cJSON_AddStringToObject(r, "status", "ok");
+			cJSON_AddStringToObject(r, "file", file);
+			cJSON_AddStringToObject(r, "format", "bayer");
+			cJSON_AddStringToObject(r, "pixfmt", "bayer-bg12-16le");
+			cJSON_AddNumberToObject(r, "width", info.width);
+			cJSON_AddNumberToObject(r, "height", info.height);
+			cJSON_AddNumberToObject(r, "bytes", (double)info.size);
+			cJSON_AddBoolToObject(r, "stream_restart", 1);
+			return rss_ctrl_resp_json(resp, resp_size, r);
+#else
+			/* Kernel road: tx-isp VIC snapraw into the ispmem
+			 * reserve. Pipeline must be streaming. */
+			char found[280];
+			int gret = bayer_snapraw_grab(found, sizeof(found));
+			if (gret == -ENOENT)
+				return rss_ctrl_resp_error(
+					resp, resp_size,
+					"no kernel raw-dump node on this platform");
+			if (gret == -EPERM)
+				return rss_ctrl_resp_error(
+					resp, resp_size,
+					"snapraw rejected (pipeline not streaming?)");
+			if (gret != 0)
+				return rss_ctrl_resp_error(
+					resp, resp_size,
+					"no raw produced within 3s (ispmem= bootarg "
+					"reserved?)");
+			if (bayer_move(found, file) != 0)
+				return rss_ctrl_resp_error(resp, resp_size, strerror(errno));
+			struct stat sb;
+			long bytes = (stat(file, &sb) == 0) ? (long)sb.st_size : 0;
+			int sw = 0, sh = 0;
+			bayer_sensor_dims(&sw, &sh);
+			RSS_INFO("save: %s (%ld bytes, bayer %dx%d)", file, bytes, sw, sh);
+			cJSON *r = cJSON_CreateObject();
+			if (!r)
+				return rss_ctrl_resp_error(resp, resp_size, "out of memory");
+			cJSON_AddStringToObject(r, "status", "ok");
+			cJSON_AddStringToObject(r, "file", file);
+			cJSON_AddStringToObject(r, "format", "bayer");
+			cJSON_AddStringToObject(r, "pixfmt", "bayer16");
+			if (sw && sh) {
+				cJSON_AddNumberToObject(r, "width", sw);
+				cJSON_AddNumberToObject(r, "height", sh);
+			}
+			cJSON_AddNumberToObject(r, "bytes", (double)bytes);
+			return rss_ctrl_resp_json(resp, resp_size, r);
+#endif
+		}
+
+		if (want_raw) {
+			/* raw = NV12 from the framesource. SnapFrame is unreliable on
+			 * a live encoder-bound channel (blocks or ENOTTY, SDK-
+			 * dependent); use the vendor-proven transient-depth pattern:
+			 * SetFrameDepth(1) -> GetFrame -> write -> release -> depth 0.
+			 * channel = video stream index. */
+			if (jpeg_ch < 0 || jpeg_ch >= st->stream_count)
+				return rss_ctrl_resp_error(resp, resp_size, "bad video channel");
+			int fs_chn = st->streams[jpeg_ch].fs_chn;
+			int ret = RSS_HAL_CALL(st->ops, fs_set_frame_depth, st->hal_ctx, fs_chn, 1);
+			if (ret == RSS_ERR_NOTSUP)
+				return rss_ctrl_resp_error(resp, resp_size,
+							   "raw snap not supported on this SoC");
+			if (ret != 0)
+				return rss_ctrl_resp_error(resp, resp_size,
+							   "frame depth alloc failed (rmem?)");
+
+			rss_frame_info_t info = {0};
+			void *frame = NULL;
+			ret = RSS_HAL_CALL(st->ops, fs_get_frame, st->hal_ctx, fs_chn, &frame,
+					   &info);
+			if (ret != 0 || !frame || !info.virt_addr || info.size == 0) {
+				RSS_HAL_CALL(st->ops, fs_set_frame_depth, st->hal_ctx, fs_chn, 0);
+				return rss_ctrl_resp_error(resp, resp_size,
+							   "raw frame grab failed");
+			}
+
+			char tmp[272];
+			snprintf(tmp, sizeof(tmp), "%s.tmp", file);
+			int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			ssize_t wr = -1;
+			if (fd >= 0) {
+				wr = write(fd, info.virt_addr, info.size);
+				close(fd);
+			}
+			RSS_HAL_CALL(st->ops, fs_release_frame, st->hal_ctx, fs_chn, frame);
+			RSS_HAL_CALL(st->ops, fs_set_frame_depth, st->hal_ctx, fs_chn, 0);
+			if (fd < 0 || wr != (ssize_t)info.size || rename(tmp, file) != 0) {
+				unlink(tmp);
+				return rss_ctrl_resp_error(resp, resp_size, strerror(errno));
+			}
+
+			RSS_INFO("save: %s (%u bytes, raw %ux%u)", file, info.size, info.width,
+				 info.height);
+			cJSON *r = cJSON_CreateObject();
+			if (!r)
+				return rss_ctrl_resp_error(resp, resp_size, "out of memory");
+			cJSON_AddStringToObject(r, "status", "ok");
+			cJSON_AddStringToObject(r, "file", file);
+			cJSON_AddStringToObject(r, "format", "raw");
+			cJSON_AddStringToObject(r, "pixfmt", "nv12");
+			cJSON_AddNumberToObject(r, "width", info.width);
+			cJSON_AddNumberToObject(r, "height", info.height);
+			cJSON_AddNumberToObject(r, "bytes", (double)info.size);
+			return rss_ctrl_resp_json(resp, resp_size, r);
+		}
+
+		if (jpeg_ch < 0 || jpeg_ch >= RVD_MAX_JPEG)
+			return rss_ctrl_resp_error(resp, resp_size, "bad jpeg channel");
+
+		char ring_name[24];
+		snprintf(ring_name, sizeof(ring_name), "jpeg%d", jpeg_ch);
+		rss_ring_t *ring = rss_ring_open(ring_name);
+		if (!ring)
+			return rss_ctrl_resp_error(resp, resp_size,
+						   "jpeg ring not available (jpeg disabled?)");
+		/* Attach as a real consumer: the demand loop starts the JPEG
+		 * encoder on reader_count, exactly as for rhd. Skip history --
+		 * small jpeg rings recycle their data region ahead of the slot
+		 * ring, so only a frame written after attach is trustworthy
+		 * (and it still gets the SOI/EOI check below). */
+		rss_ring_acquire(ring);
+		uint64_t read_seq =
+			atomic_load(&((rss_ring_header_t *)rss_ring_get_header(ring))->write_seq);
+
+		uint32_t buf_size = rss_ring_max_frame_size(ring);
+		uint8_t *buf = malloc(buf_size);
+		uint32_t len = 0;
+		bool got = false;
+		if (buf) {
+			for (int waited = 0; waited < 3000; waited += 200) {
+				if (rss_ring_wait(ring, 200) != 0)
+					continue;
+				rss_ring_slot_t meta;
+				if (rss_ring_read(ring, &read_seq, buf, buf_size, &len, &meta) != 0)
+					continue;
+				/* SOI only: a torn frame loses its head, and gen3
+				 * encoders emit no trailing EOI at all. */
+				if (len >= 4 && buf[0] == 0xFF && buf[1] == 0xD8) {
+					got = true;
+					break;
+				}
+			}
+		}
+		rss_ring_release(ring);
+		rss_ring_close(ring);
+		if (!buf)
+			return rss_ctrl_resp_error(resp, resp_size, "out of memory");
+		if (!got) {
+			free(buf);
+			return rss_ctrl_resp_error(resp, resp_size,
+						   "no complete jpeg frame within 3s");
+		}
+
+		/* Write via temp + rename so watchers never see a partial file */
+		char tmp[272];
+		snprintf(tmp, sizeof(tmp), "%s.tmp", file);
+		int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		ssize_t wr = -1;
+		if (fd >= 0) {
+			wr = write(fd, buf, len);
+			close(fd);
+		}
+		free(buf);
+		if (fd < 0 || wr != (ssize_t)len || rename(tmp, file) != 0) {
+			unlink(tmp);
+			return rss_ctrl_resp_error(resp, resp_size, strerror(errno));
+		}
+
+		RSS_INFO("save: %s (%u bytes, %s)", file, len, format);
+		cJSON *r = cJSON_CreateObject();
+		if (!r)
+			return rss_ctrl_resp_error(resp, resp_size, "out of memory");
+		cJSON_AddStringToObject(r, "status", "ok");
+		cJSON_AddStringToObject(r, "file", file);
+		cJSON_AddStringToObject(r, "format", format);
+		cJSON_AddNumberToObject(r, "bytes", (double)len);
+		return rss_ctrl_resp_json(resp, resp_size, r);
 	}
 
 	if (strcmp(cmd, "set-jpeg-quality") == 0) {
@@ -1772,8 +2345,8 @@ static int handle_config_cmd(const char *cmd, const char *cmd_json, rvd_state_t 
 			rvd_stream_t *s = &st->streams[i];
 			uint32_t avg_br = 0;
 			if (!st->v4l2_backend)
-				RSS_HAL_CALL(st->ops, enc_get_avg_bitrate, st->hal_ctx,
-					     s->chn, &avg_br);
+				RSS_HAL_CALL(st->ops, enc_get_avg_bitrate, st->hal_ctx, s->chn,
+					     &avg_br);
 			cJSON *item = cJSON_CreateObject();
 			cJSON_AddNumberToObject(item, "chn", (double)s->chn);
 			cJSON_AddNumberToObject(item, "w", (double)s->enc_cfg.width);
@@ -1815,9 +2388,8 @@ static int handle_config_cmd(const char *cmd, const char *cmd_json, rvd_state_t 
 				any_privacy = true;
 		}
 		char rad_resp[64];
-		rss_ctrl_send_command(RSS_RUN_DIR "/rad.sock",
-				      any_privacy ? "{\"cmd\":\"mute\"}" : "{\"cmd\":\"unmute\"}",
-				      rad_resp, sizeof(rad_resp), 1000);
+		rss_ctrl_cmd(RSS_RUN_DIR "/rad.sock", any_privacy ? "mute" : "unmute", rad_resp,
+			     sizeof(rad_resp), 1000);
 
 		cJSON *r = cJSON_CreateObject();
 		cJSON_AddStringToObject(r, "status", "ok");
@@ -1887,7 +2459,7 @@ int rvd_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_size, vo
 	    strcmp(cmd, "get-rc-mode") != 0 && strcmp(cmd, "config-show") != 0 &&
 	    strcmp(cmd, "status") != 0)
 		return rss_ctrl_resp_error(resp_buf, resp_buf_size,
-			"not supported by the V4L2 backend");
+					   "not supported by the V4L2 backend");
 
 	if ((len = handle_encoder_cmd(cmd, cmd_json, st, resp_buf, resp_buf_size)) > 0)
 		return len;

@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -26,30 +27,11 @@
 #include <rss_common.h>
 
 #include "rad.h"
+#include "rad_clock.h"
+#include "rad_resync.h"
 
-/*
- * Synthetic audio clock slew (AI loop). The clock advances by sample
- * count, so ADC crystal error and samples lost inside the SDK (FIFO
- * overrun during stalls) otherwise accumulate as unbounded A/V drift
- * in every consumer. Each chunk, compare against CLOCK_MONOTONIC:
- * beyond a resync threshold re-anchor hard and warn; beyond the NUDGE
- * band (chunk-scheduling jitter floor) correct by 1ms. Authority is
- * 1ms per 20ms chunk — far above any crystal error, gentle enough to
- * stay inaudible in timestamp terms.
- *
- * The thresholds are asymmetric. Clock BEHIND wall = samples lost or
- * a stall; it never self-heals, so resync at 150ms. Clock AHEAD of
- * wall happens legitimately while draining the SDK's buffered chunks
- * after a stall or at startup (frame_depth ~400ms read back-to-back
- * outruns wall) — a symmetric threshold fires repeated backward
- * resyncs mid-drain, rewinding the published timeline. Tolerate up to
- * 1s ahead (T23 measured ~760ms of real salvage; decays via nudge in
- * seconds); beyond that something is truly wrong.
- */
-#define RAD_SYNTH_RESYNC_BEHIND_US 150000
-#define RAD_SYNTH_RESYNC_AHEAD_US  1000000
-#define RAD_SYNTH_NUDGE_BAND_US	   20000
-#define RAD_SYNTH_NUDGE_US	   1000
+/* Synthetic audio clock: sample-count advance slewed toward
+ * CLOCK_MONOTONIC. Control law and its history live in rad_clock.c. */
 
 /* ── AO thread context (needed by ctrl handler for ao-enable/ao-disable) ── */
 
@@ -61,6 +43,13 @@ typedef struct {
 	_Atomic int flush;
 	_Atomic int rate_pending;
 	_Atomic int sample_rate;
+	/* ao-drain handshake: the ctrl handler requests, the AO thread
+	 * executes (AO channel calls must come from the owning thread) */
+	_Atomic int drain_requested;
+	_Atomic uint64_t drain_target_seq;
+	bool drain_done; /* guarded by drain_mtx */
+	pthread_mutex_t drain_mtx;
+	pthread_cond_t drain_cv;
 } ao_thread_ctx_t;
 
 static void *ao_playback_thread(void *arg);
@@ -104,7 +93,7 @@ typedef struct {
 	rad_codec_ctx_t *codec_ctx;
 	uint8_t **encode_buf;
 	int *encode_buf_size;
-	int64_t *synth_audio_ts;
+	rad_clock_t *synth_clock;
 } rad_ctrl_ctx_t;
 
 static int rad_fmt_result(char *buf, int bufsz, int ret)
@@ -381,12 +370,13 @@ static int rad_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 			RSS_HAL_CALL(ctx->ops, audio_deinit, ctx->hal_ctx);
 			return rss_ctrl_resp_error(resp_buf, resp_buf_size, "ring create failed");
 		}
-		rss_ring_set_stream_info(*ctx->ring, 0x10, ctx->codec_id, 0, 0, ctx->sample_rate, 1,
-					 0, 0);
+		rss_ring_set_stream_info(*ctx->ring, 0x10, ctx->codec_id,
+					 (uint32_t)ctx->codec_ctx->frame_samples, 0,
+					 ctx->sample_rate, 1, ctx->codec_ctx->aot, 0);
 		ctx->codec_ctx->ring = *ctx->ring;
 
 		ctx->ai_disabled = false;
-		*ctx->synth_audio_ts = rss_timestamp_us();
+		rad_clock_init(ctx->synth_clock, rss_timestamp_us());
 		RSS_INFO("audio input enabled: %s %d Hz", ctx->codec_str, ctx->sample_rate);
 		return rss_ctrl_resp_ok(resp_buf, resp_buf_size);
 	}
@@ -432,6 +422,43 @@ static int rad_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 	if (strcmp(cmd, "ao-flush") == 0) {
 		if (ctx->ao_flush)
 			atomic_store(ctx->ao_flush, 1);
+		return rss_ctrl_resp_ok(resp_buf, resp_buf_size);
+	}
+
+	if (strcmp(cmd, "ao-drain") == 0) {
+		if (!ctx->ao_enabled)
+			return rss_ctrl_resp_ok(resp_buf, resp_buf_size);
+
+		/* Snapshot how far the producer has published; the AO thread
+		 * drains once it has consumed (and played) up to that point. */
+		uint64_t target = 0;
+		rss_ring_t *speaker = rss_ring_open("speaker");
+		if (speaker) {
+			const rss_ring_header_t *shdr = rss_ring_get_header(speaker);
+			target = atomic_load(&shdr->write_seq);
+			rss_ring_close(speaker);
+		}
+
+		ao_thread_ctx_t *ao = ctx->ao_ctx;
+		pthread_mutex_lock(&ao->drain_mtx);
+		ao->drain_done = false;
+		atomic_store(&ao->drain_target_seq, target);
+		atomic_store(&ao->drain_requested, 1);
+
+		/* Hard 3s cap keeps this under the 5s default ctrl timeout */
+		struct timespec deadline;
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += 3;
+		int rc = 0;
+		while (!ao->drain_done && rc != ETIMEDOUT)
+			rc = pthread_cond_timedwait(&ao->drain_cv, &ao->drain_mtx, &deadline);
+		bool done = ao->drain_done;
+		if (!done)
+			atomic_store(&ao->drain_requested, 0);
+		pthread_mutex_unlock(&ao->drain_mtx);
+
+		if (!done)
+			return rss_ctrl_resp_error(resp_buf, resp_buf_size, "drain timeout");
 		return rss_ctrl_resp_ok(resp_buf, resp_buf_size);
 	}
 
@@ -499,6 +526,7 @@ static int rad_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 		atomic_store(&ctx->ao_ctx->flush, 0);
 		atomic_store(&ctx->ao_ctx->rate_pending, 0);
 		atomic_store(&ctx->ao_ctx->sample_rate, ao_rate);
+		atomic_store(&ctx->ao_ctx->drain_requested, 0);
 
 		if (pthread_create(ctx->ao_tid, NULL, ao_playback_thread, ctx->ao_ctx) != 0) {
 			RSS_HAL_CALL(ctx->ops, ao_deinit, ctx->hal_ctx);
@@ -730,8 +758,9 @@ static int rad_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 			RSS_FATAL("audio-restart: ring create failed");
 			return rss_ctrl_resp_error(resp_buf, resp_buf_size, "ring create failed");
 		}
-		rss_ring_set_stream_info(*ctx->ring, 0x10, new_codec_id, 0, 0, new_sample_rate, 1,
-					 0, 0);
+		rss_ring_set_stream_info(*ctx->ring, 0x10, new_codec_id,
+					 (uint32_t)ctx->codec_ctx->frame_samples, 0,
+					 new_sample_rate, 1, ctx->codec_ctx->aot, 0);
 		ctx->codec_ctx->ring = *ctx->ring;
 
 		/* 7. Resize encode buffer if needed */
@@ -839,6 +868,27 @@ static void ao_apply_rate_change(ao_thread_ctx_t *ctx)
 	}
 }
 
+/* Complete a pending ao-drain once the ring is consumed up to the target.
+ * ao_flush_buf blocks until the hardware has played everything queued, so
+ * it must run here, in the thread that owns the AO channel. */
+static void ao_check_drain(ao_thread_ctx_t *ctx, bool ring_attached, uint64_t read_seq)
+{
+	if (!atomic_load(&ctx->drain_requested))
+		return;
+	if (ring_attached && read_seq < atomic_load(&ctx->drain_target_seq))
+		return;
+
+	int ret = RSS_HAL_CALL(ctx->ops, ao_flush_buf, ctx->hal_ctx);
+	if (ret != 0)
+		RSS_DEBUG("ao_flush_buf: %d", ret);
+
+	pthread_mutex_lock(&ctx->drain_mtx);
+	if (atomic_exchange(&ctx->drain_requested, 0))
+		ctx->drain_done = true;
+	pthread_cond_broadcast(&ctx->drain_cv);
+	pthread_mutex_unlock(&ctx->drain_mtx);
+}
+
 static void *ao_playback_thread(void *arg)
 {
 	ao_thread_ctx_t *ctx = arg;
@@ -857,6 +907,7 @@ static void *ao_playback_thread(void *arg)
 				RSS_HAL_CALL(ctx->ops, ao_clear_buf, ctx->hal_ctx);
 				RSS_DEBUG("ao: flushed hardware buffer");
 			}
+			ao_check_drain(ctx, false, 0);
 			ring = rss_ring_open("speaker");
 			if (ring) {
 				rss_ring_check_version(ring, "speaker");
@@ -894,6 +945,7 @@ static void *ao_playback_thread(void *arg)
 				RSS_DEBUG("ao: flush requested, dropping ring");
 				break;
 			}
+			ao_check_drain(ctx, true, read_seq);
 
 			uint32_t length = 0;
 			rss_ring_slot_t meta;
@@ -1010,6 +1062,9 @@ int main(int argc, char **argv)
 	 * until audio_init has succeeded; ao_enabled defaults to false. */
 	rad_ctrl_ctx_t ctrl_ctx = {.ai_disabled = true};
 
+	pthread_mutex_init(&ao_ctx.drain_mtx, NULL);
+	pthread_cond_init(&ao_ctx.drain_cv, NULL);
+
 	rss_hal_ctx_t *hal_ctx = rss_hal_create();
 	if (!hal_ctx) {
 		RSS_FATAL("rss_hal_create failed");
@@ -1117,11 +1172,9 @@ int main(int argc, char **argv)
 #endif
 
 	/* ── Audio output (speaker) ── */
-	ao_ctx = (ao_thread_ctx_t){
-		.ops = ops,
-		.hal_ctx = hal_ctx,
-		.running = dctx.running,
-	};
+	ao_ctx.ops = ops;
+	ao_ctx.hal_ctx = hal_ctx;
+	ao_ctx.running = dctx.running;
 	ao_enabled = rss_config_get_bool(dctx.cfg, "audio", "ao_enabled", false);
 
 	if (ao_enabled) {
@@ -1179,7 +1232,8 @@ int main(int argc, char **argv)
 		RSS_FATAL("failed to create audio ring");
 		goto cleanup;
 	}
-	rss_ring_set_stream_info(ring, 0x10, codec_id, 0, 0, sample_rate, 1, 0, 0);
+	rss_ring_set_stream_info(ring, 0x10, codec_id, (uint32_t)codec_ctx.frame_samples, 0,
+				 sample_rate, 1, codec_ctx.aot, 0);
 
 	/* Encode buffer — sized by codec plugin */
 	int encode_buf_size = codec_ctx.encode_buf_size;
@@ -1203,8 +1257,9 @@ int main(int argc, char **argv)
 	RSS_DEBUG("audio loop: %d samples/frame (%dms), %s", audio_cfg.samples_per_frame, 1000 / 50,
 		  codec_str);
 
-	int64_t synth_audio_ts = rss_timestamp_us();
-	int64_t last_read_us = 0; /* pacing detector for the clock slew */
+	rad_clock_t synth_clock;
+	rad_clock_init(&synth_clock, rss_timestamp_us());
+	rad_resync_log_t resync_log = {0};
 
 	ctrl_ctx = (rad_ctrl_ctx_t){
 		.cfg = dctx.cfg,
@@ -1240,7 +1295,7 @@ int main(int argc, char **argv)
 		.codec_ctx = &codec_ctx,
 		.encode_buf = &encode_buf,
 		.encode_buf_size = &encode_buf_size,
-		.synth_audio_ts = &synth_audio_ts,
+		.synth_clock = &synth_clock,
 	};
 
 	uint64_t frame_count = 0;
@@ -1281,44 +1336,17 @@ int main(int argc, char **argv)
 		if (samples > max_samples)
 			samples = max_samples;
 
-		/* Always use synthetic timestamps from IMP_System_GetTimeStamp.
+		/* Always use synthetic timestamps from the sample counter.
 		 * SDK audio timestamps use a different clock than the encoder
 		 * on some SoCs (T31), causing A-V sync drift. Synthetic
-		 * timestamps share the encoder's clock source. */
-		int64_t ts = synth_audio_ts;
-		synth_audio_ts += (int64_t)samples * 1000000 / ctrl_ctx.sample_rate;
-
-		/* Slew toward CLOCK_MONOTONIC (see RAD_SYNTH_* above).
-		 * Hard resyncs are gated to live-paced reads: an instant
-		 * return served a chunk the SDK had already buffered (drain
-		 * burst or scheduler batch) and a long-gap return is the
-		 * oldest buffered chunk right after a stall — old audio on
-		 * the old continuous timeline, where wall comparison
-		 * misfires. Drain chunks can trickle as slowly as ~15ms on a
-		 * loaded SoC, so live means close to the 20ms chunk cadence,
-		 * not merely non-instant. At the first live-paced read after a
-		 * stall the residual error is exactly the audio the SDK really
-		 * lost, so the resync inserts a gap of the right size. Nudges are
-		 * NOT gated: during drains they are bounded zero-mean noise,
-		 * but gating them biases which chunks get evaluated and
-		 * skews the long-run rate (measured -1000ppm under a
-		 * +5000ppm test clock; ungated tracks true rate). */
+		 * timestamps share the encoder's clock source; the control
+		 * law slewing them toward CLOCK_MONOTONIC lives in
+		 * rad_clock.c together with the history that shaped it. */
 		int64_t now_us = rss_timestamp_us();
-		int64_t read_gap = now_us - last_read_us;
-		last_read_us = now_us;
-		bool live_paced = read_gap >= 15000 && read_gap <= 150000;
-		int64_t clk_err = now_us - synth_audio_ts;
-		if (clk_err > RAD_SYNTH_RESYNC_BEHIND_US || clk_err < -RAD_SYNTH_RESYNC_AHEAD_US) {
-			if (live_paced) {
-				RSS_WARN("audio clock resync %+lldms (lost samples or stall)",
-					 (long long)(clk_err / 1000));
-				synth_audio_ts += clk_err;
-			}
-		} else if (clk_err > RAD_SYNTH_NUDGE_BAND_US) {
-			synth_audio_ts += RAD_SYNTH_NUDGE_US;
-		} else if (clk_err < -RAD_SYNTH_NUDGE_BAND_US) {
-			synth_audio_ts -= RAD_SYNTH_NUDGE_US;
-		}
+		int64_t ts = rad_clock_stamp(&synth_clock, samples, ctrl_ctx.sample_rate, now_us);
+		rad_resync_tick(&resync_log, now_us);
+		if (synth_clock.resync_us)
+			rad_resync_note(&resync_log, now_us, synth_clock.resync_us);
 
 		const int16_t *pcm = frame.data;
 		int out_len = 0;
@@ -1336,7 +1364,7 @@ int main(int argc, char **argv)
 
 		int64_t now = rss_timestamp_us();
 		if (now - last_stats >= 30000000) {
-			RSS_DEBUG("audio frames: %llu", (unsigned long long)frame_count);
+			RSS_TRACE("audio frames: %llu", (unsigned long long)frame_count);
 			last_stats = now;
 		}
 	}
@@ -1350,6 +1378,8 @@ cleanup:
 	}
 	if (ctrl)
 		rss_ctrl_destroy(ctrl);
+	pthread_mutex_destroy(&ao_ctx.drain_mtx);
+	pthread_cond_destroy(&ao_ctx.drain_cv);
 	free(encode_buf);
 	if (codec_ops && codec_ops->deinit)
 		codec_ops->deinit(&codec_ctx);

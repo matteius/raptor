@@ -1,5 +1,6 @@
 #include "greatest.h"
 
+extern SUITE(ric_json_suite);
 extern SUITE(nal_suite);
 extern SUITE(prebuf_suite);
 extern SUITE(mux_suite);
@@ -16,12 +17,19 @@ extern SUITE(rsp_state_suite);
 extern SUITE(ctrl_suite);
 extern SUITE(sign_suite);
 extern SUITE(storage_suite);
+extern SUITE(timelapse_suite);
+extern SUITE(sendq_suite);
+extern SUITE(rad_clock_suite);
+extern SUITE(resync_suite);
+extern SUITE(backchannel_suite);
+extern SUITE(config_suite);
 
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
 {
 	GREATEST_MAIN_BEGIN();
+	RUN_SUITE(ric_json_suite);
 	RUN_SUITE(nal_suite);
 	RUN_SUITE(prebuf_suite);
 	RUN_SUITE(mux_suite);
@@ -38,5 +46,11 @@ int main(int argc, char **argv)
 	RUN_SUITE(ctrl_suite);
 	RUN_SUITE(sign_suite);
 	RUN_SUITE(storage_suite);
+	RUN_SUITE(timelapse_suite);
+	RUN_SUITE(sendq_suite);
+	RUN_SUITE(rad_clock_suite);
+	RUN_SUITE(resync_suite);
+	RUN_SUITE(backchannel_suite);
+	RUN_SUITE(config_suite);
 	GREATEST_MAIN_END();
 }

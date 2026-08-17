@@ -34,6 +34,7 @@
 #define RHD_RECV_BUF	    4096
 #define RHD_MJPEG_BOUNDARY  "raptorframe"
 #define RHD_SEND_TIMEOUT_MS 3000 /* max time to drain a one-shot response */
+#define RHD_SNAP_TIMEOUT_MS 5000 /* max wait for a JPEG encoder to produce a fresh frame */
 #define RHD_MAX_JPEG	    6	 /* up to 2 per sensor, 3 sensors */
 
 /* Index page — loaded from file on first request, cached */
@@ -78,6 +79,18 @@ typedef struct {
 	char recv_buf[RHD_RECV_BUF];
 	size_t recv_len;
 
+	/*
+	 * Parked /snap request. An idle JPEG encoder needs a frame period or
+	 * more to produce, and this daemon serves every client from one
+	 * thread, so waiting for it inline stalls MJPEG and audio for the
+	 * duration. The request is held here and completed from the main
+	 * loop instead.
+	 */
+	bool snap_pending;
+	int snap_stream;       /* JPEG ring index */
+	uint64_t snap_seq;     /* read cursor, started past the ring's contents */
+	int64_t snap_deadline; /* monotonic ms */
+
 	/* Non-blocking send buffer (snapshot / one-shot responses) */
 	uint8_t *send_buf;  /* heap-allocated response (header + body) */
 	uint32_t send_len;  /* total bytes to send */
@@ -114,10 +127,17 @@ typedef struct {
 	rss_ring_t *audio_ring;
 	int audio_codec;       /* codec ID from ring header */
 	int audio_sample_rate; /* sample rate from ring header */
+	int audio_adts_rate;   /* rate declared in ADTS (core rate for HE-AAC) */
 
 	/* Snapshot read buffer (shared, single-threaded) */
 	uint8_t *snap_buf;
 	uint32_t snap_buf_size;
+
+	/* MJPEG fan-out buffer and per-ring read cursors (main loop only) */
+	uint8_t *frame_buf;
+	uint32_t frame_buf_size; /* largest ring frame */
+	uint32_t frame_buf_cap;	 /* + EXIF and signing headroom */
+	uint64_t jpeg_read_seqs[RHD_MAX_JPEG];
 
 	/* JPEG capture-time EXIF + snapshot signing */
 	bool exif_timestamp;

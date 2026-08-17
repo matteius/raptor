@@ -690,7 +690,7 @@ void *rwd_video_reader_thread(void *arg)
 			const rss_ring_header_t *vhdr = rss_ring_get_header(srv->video_rings[s]);
 			uint64_t ws = vhdr->write_seq;
 			if (ws > read_seq + 10 && read_seq > 0) {
-				read_seq = ws - 1;
+				read_seq = ws;
 				rwd_request_idr(srv, s);
 				pthread_mutex_lock(&srv->clients_lock);
 				for (int i = 0; i < RWD_MAX_CLIENTS; i++) {
@@ -888,6 +888,9 @@ void *rwd_audio_reader_thread(void *arg)
 
 	uint32_t audio_codec = 0;
 	int sample_rate = 0;
+#ifdef RAPTOR_AAC
+	uint8_t audio_profile = 0; /* ring header AAC object type; 5 = HE (SBR) */
+#endif
 	int64_t audio_ts_epoch = 0;
 	uint8_t audio_buf[4096];
 	uint8_t transcode_out[1024]; /* max Opus or PCMU frame output */
@@ -897,7 +900,7 @@ void *rwd_audio_reader_thread(void *arg)
 
 	/* PCM decode/accumulation buffer for transcoding (handles non-aligned
 	 * frame sizes like AAC's 1024 samples vs Opus's 320/960) */
-	int16_t pcm_accum[2048];
+	int16_t pcm_accum[4096]; /* AAC writes 1024, or 2048 with SBR */
 	int pcm_accum_fill = 0;
 #ifdef RAPTOR_OPUS
 	int opus_frame_size = 0;  /* valid Opus frame size for current sample rate */
@@ -926,6 +929,9 @@ void *rwd_audio_reader_thread(void *arg)
 			const rss_ring_header_t *ahdr = rss_ring_get_header(srv->audio_ring);
 			audio_codec = ahdr->codec;
 			sample_rate = ahdr->fps_num;
+#ifdef RAPTOR_AAC
+			audio_profile = ahdr->profile;
+#endif
 			srv->audio_read_seq = ahdr->write_seq;
 			audio_ts_epoch = 0;
 			last_write_seq = 0;
@@ -1037,10 +1043,21 @@ void *rwd_audio_reader_thread(void *arg)
 			if (need_transcode && audio_codec == RWD_CODEC_AAC) {
 				aac_dec = AACInitDecoder();
 				if (aac_dec) {
+					/* HE-AAC v1 (profile 5) carries an LC core
+					 * at HALF the output rate; Helix indexes its
+					 * scalefactor-band tables by the core rate
+					 * and detects SBR from the fill element,
+					 * doubling the output back. Its raw-params
+					 * check also requires AAC_PROFILE_LC. */
 					AACFrameInfo fi = {0};
 					fi.nChans = 1;
-					fi.sampRateCore = sample_rate;
-					AACSetRawBlockParams(aac_dec, 0, &fi);
+					fi.sampRateCore = (audio_profile == 5) ? sample_rate / 2
+									       : sample_rate;
+					fi.profile = AAC_PROFILE_LC;
+					int perr = AACSetRawBlockParams(aac_dec, 0, &fi);
+					if (perr != 0)
+						RSS_WARN("media: AAC raw params rejected: %d",
+							 perr);
 				} else {
 					RSS_WARN("media: AAC decoder init failed");
 				}
@@ -1166,7 +1183,7 @@ void *rwd_audio_reader_thread(void *arg)
 #ifdef RAPTOR_AAC
 								  aac_dec,
 #endif
-								  pcm_accum, 2048);
+								  pcm_accum, 4096);
 					int step = (sample_rate > 8000) ? sample_rate / 8000 : 1;
 					n -= n % step;
 					enc_len = n / step;
@@ -1210,11 +1227,11 @@ void *rwd_audio_reader_thread(void *arg)
 			else if (opus_enc && opus_frame_size > 0) {
 				/* Decode → accumulate → encode Opus in 20ms frames.
 				 * Each Opus frame advances RTP ts by 960 (48kHz × 20ms).
-				 * Decode directly into pcm_accum to avoid a 4KB temp buffer.
-				 * Need at least 1024 slots free: AAC decoder writes a full
-				 * frame regardless of pcm_max. */
-				int space = 2048 - pcm_accum_fill;
-				if (space >= 1024) {
+				 * Decode directly into pcm_accum to avoid a temp buffer.
+				 * The AAC decoder writes a full frame regardless of
+				 * pcm_max: 1024 samples, or 2048 with SBR (HE-AAC). */
+				int space = 4096 - pcm_accum_fill;
+				if (space >= 2048) {
 					int n = rwd_decode_to_pcm(audio_codec, audio_buf, length,
 #ifdef RAPTOR_AAC
 								  aac_dec,

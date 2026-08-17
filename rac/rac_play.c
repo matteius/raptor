@@ -4,6 +4,7 @@
  * Decode audio (PCM, MP3, AAC, Opus) and publish to speaker ring.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -122,9 +123,10 @@ static int resample_linear(const int16_t *in, int in_samples, int in_rate, int16
 	return out_samples;
 }
 
-/* Resample (if needed), chunk into 20ms frames, publish to ring */
-static void publish_pcm(rss_ring_t *ring, rac_pacer_t *pacer, const int16_t *pcm, int samples,
-			int src_rate, int dst_rate)
+/* Resample (if needed), chunk into 20ms frames, publish to ring.
+ * Returns the number of samples published at dst_rate. */
+static int publish_pcm(rss_ring_t *ring, rac_pacer_t *pacer, const int16_t *pcm, int samples,
+		       int src_rate, int dst_rate)
 {
 	int16_t resamp_buf[8192];
 	const int16_t *data = pcm;
@@ -148,8 +150,21 @@ static void publish_pcm(rss_ring_t *ring, rac_pacer_t *pacer, const int16_t *pcm
 		off += n;
 		pacer_advance(pacer, n);
 	}
+	return count;
 }
 #endif
+
+/* Ask RAD to drain the hardware pipeline: it consumes the ring tail and
+ * blocks until the last sample has played (IMP_AO_FlushChnBuf), which is
+ * what prevents end-of-playback cutoff. Falls back to a fixed sleep when
+ * RAD is unreachable or answers with an error. */
+static void rad_drain_or_sleep(void)
+{
+	char resp[128];
+	int r = rss_ctrl_cmd(RSS_RUN_DIR "/rad.sock", "ao-drain", resp, sizeof(resp), 4000);
+	if (r <= 0 || !rss_ctrl_resp_is_ok(resp))
+		usleep(100000);
+}
 
 /* ── Play: decode and write PCM16 to speaker ring ── */
 
@@ -189,8 +204,7 @@ int cmd_play(const char *src, int sample_rate)
 	/* Tell RAD to flush stale hardware audio and prepare for new playback */
 	{
 		char resp[256];
-		rss_ctrl_send_command(RSS_RUN_DIR "/rad.sock", "{\"cmd\":\"ao-flush\"}", resp,
-				      sizeof(resp), 500);
+		rss_ctrl_cmd(RSS_RUN_DIR "/rad.sock", "ao-flush", resp, sizeof(resp), 500);
 	}
 
 	/* Create speaker ring */
@@ -211,7 +225,6 @@ int cmd_play(const char *src, int sample_rate)
 	}
 
 	int ret = 0;
-	int64_t start_time = rss_timestamp_us();
 	uint64_t total_samples = 0;
 	rac_pacer_t pacer;
 	pacer_init(&pacer, sample_rate);
@@ -335,8 +348,8 @@ int cmd_play(const char *src, int sample_rate)
 				for (int i = 0; i < samples; i++)
 					pcm_buf[i] = (pcm_buf[i * 2] + pcm_buf[i * 2 + 1]) / 2;
 			}
-			publish_pcm(ring, &pacer, pcm_buf, samples, info.samprate, sample_rate);
-			total_samples += samples;
+			total_samples += publish_pcm(ring, &pacer, pcm_buf, samples, info.samprate,
+						     sample_rate);
 		}
 		free(buf);
 		MP3FreeDecoder(mp3);
@@ -419,8 +432,8 @@ int cmd_play(const char *src, int sample_rate)
 				for (int i = 0; i < samples; i++)
 					pcm_buf[i] = (pcm_buf[i * 2] + pcm_buf[i * 2 + 1]) / 2;
 			}
-			publish_pcm(ring, &pacer, pcm_buf, samples, info.sampRateOut, sample_rate);
-			total_samples += samples;
+			total_samples += publish_pcm(ring, &pacer, pcm_buf, samples,
+						     info.sampRateOut, sample_rate);
 		}
 		free(buf);
 		AACFreeDecoder(aac);
@@ -527,12 +540,11 @@ int cmd_play(const char *src, int sample_rate)
 							int decoded =
 								opus_decode(opus_dec, pkt, pkt_len,
 									    pcm_buf, 5760, 0);
-							if (decoded > 0) {
-								publish_pcm(ring, &pacer, pcm_buf,
-									    decoded, opus_rate,
-									    sample_rate);
-								total_samples += decoded;
-							}
+							if (decoded > 0)
+								total_samples += publish_pcm(
+									ring, &pacer, pcm_buf,
+									decoded, opus_rate,
+									sample_rate);
 						}
 						pkt += pkt_len;
 						pkt_len = 0;
@@ -544,11 +556,10 @@ int cmd_play(const char *src, int sample_rate)
 				if (pkt_len > 0) {
 					int decoded = opus_decode(opus_dec, pkt, pkt_len, pcm_buf,
 								  5760, 0);
-					if (decoded > 0) {
-						publish_pcm(ring, &pacer, pcm_buf, decoded,
-							    opus_rate, sample_rate);
-						total_samples += decoded;
-					}
+					if (decoded > 0)
+						total_samples +=
+							publish_pcm(ring, &pacer, pcm_buf, decoded,
+								    opus_rate, sample_rate);
 				}
 			}
 
@@ -567,13 +578,95 @@ int cmd_play(const char *src, int sample_rate)
 	}
 
 done:
-	/* Let AO thread drain remaining frames, then destroy so it reconnects next time */
-	usleep(100000);
+	rad_drain_or_sleep();
 	rss_ring_destroy(ring);
 	if (!is_stdin)
 		fclose(in);
-	double duration = (double)(rss_timestamp_us() - start_time) / 1000000.0;
+	double duration = (double)total_samples / sample_rate;
 	fprintf(stderr, "rac: played %.1fs, %llu samples\n", duration,
 		(unsigned long long)total_samples);
 	return ret;
+}
+
+/* ── Beep: synthesize a sine tone, no file needed ── */
+
+int cmd_beep(int freq_hz, int duration_ms, int sample_rate)
+{
+	if (freq_hz < 20 || freq_hz > sample_rate / 2) {
+		fprintf(stderr, "rac: frequency must be 20..%d Hz at %d Hz output\n",
+			sample_rate / 2, sample_rate);
+		return 1;
+	}
+	if (duration_ms < 10 || duration_ms > 30000) {
+		fprintf(stderr, "rac: duration must be 10..30000 ms\n");
+		return 1;
+	}
+
+	fprintf(stderr, "rac: beep %d Hz, %d ms, %d Hz output\n", freq_hz, duration_ms,
+		sample_rate);
+
+	/* Same prologue as playback: flush stale hardware audio, own the
+	 * speaker ring, give the AO thread a moment to attach. */
+	{
+		char resp[256];
+		rss_ctrl_cmd(RSS_RUN_DIR "/rad.sock", "ao-flush", resp, sizeof(resp), 500);
+	}
+	rss_ring_t *ring = rss_ring_create("speaker", 16, 64 * 1024);
+	if (!ring) {
+		fprintf(stderr, "rac: failed to create speaker ring\n");
+		return 1;
+	}
+	rss_ring_set_stream_info(ring, 0x11, 0, 0, 0, sample_rate, 1, 0, 0);
+	for (int i = 0; i < 40 && g_running; i++) {
+		if (rss_ring_reader_count(ring) > 0)
+			break;
+		usleep(5000);
+	}
+
+	int total = (int)((int64_t)sample_rate * duration_ms / 1000);
+	/* Raised-cosine ramps kill the on/off clicks; 5ms, or a quarter of a
+	 * very short beep. */
+	int ramp = sample_rate * 5 / 1000;
+	if (ramp > total / 4)
+		ramp = total / 4;
+
+	rac_pacer_t pacer;
+	pacer_init(&pacer, sample_rate);
+
+	int chunk = sample_rate / 50; /* 20ms */
+	int16_t *buf = malloc((size_t)chunk * sizeof(int16_t));
+	if (!buf) {
+		rss_ring_destroy(ring);
+		return 1;
+	}
+
+	const double step = 2.0 * M_PI * freq_hz / sample_rate;
+	double phase = 0.0;
+	uint64_t total_samples = 0;
+	int done_samples = 0;
+	while (done_samples < total && g_running) {
+		int n = total - done_samples < chunk ? total - done_samples : chunk;
+		for (int i = 0; i < n; i++) {
+			int idx = done_samples + i;
+			double amp = 0.35;
+			if (idx < ramp)
+				amp *= 0.5 * (1.0 - cos(M_PI * idx / ramp));
+			else if (idx >= total - ramp)
+				amp *= 0.5 * (1.0 - cos(M_PI * (total - 1 - idx) / ramp));
+			buf[i] = (int16_t)(32767.0 * amp * sin(phase));
+			phase += step;
+		}
+		rss_ring_publish(ring, (const uint8_t *)buf, (uint32_t)(n * 2), rss_timestamp_us(),
+				 0, 0);
+		total_samples += (uint64_t)n;
+		done_samples += n;
+		pacer_advance(&pacer, n);
+	}
+	free(buf);
+
+	rad_drain_or_sleep();
+	rss_ring_destroy(ring);
+	fprintf(stderr, "rac: beeped %.1fs, %llu samples\n", (double)total_samples / sample_rate,
+		(unsigned long long)total_samples);
+	return 0;
 }

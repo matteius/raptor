@@ -229,6 +229,23 @@ static int rsr_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 
 /* ── Main loop ── */
 
+/* Derive the audio parameters used by the TS muxer from a ring header.
+ * Both the startup attach and the runtime re-attach must set the same
+ * fields; keeping this in one place stops the ADTS rate from silently
+ * defaulting to 44.1kHz when only one path is updated. */
+static void rsr_set_audio_params(rsr_state_t *st, const rss_ring_header_t *ahdr)
+{
+	st->audio_codec = ahdr->codec;
+	st->audio_sample_rate = ahdr->fps_num;
+	/* HE-AAC over ADTS uses implicit SBR signaling: the header
+	 * declares the core rate and the decoder doubles it on SBR
+	 * detection. */
+	st->audio_adts_rate =
+		(ahdr->profile == 5) ? st->audio_sample_rate / 2 : st->audio_sample_rate;
+	st->audio_ts_type = audio_codec_to_ts(ahdr->codec);
+	st->audio_read_seq = ahdr->write_seq;
+}
+
 static void build_adts_header(uint8_t *buf, uint32_t sample_rate, int frame_len)
 {
 	static const int sr_table[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000,
@@ -283,10 +300,7 @@ static void serve_loop(rsr_state_t *st)
 			if (st->audio_ring) {
 				rss_ring_check_version(st->audio_ring, "audio");
 				const rss_ring_header_t *ahdr = rss_ring_get_header(st->audio_ring);
-				st->audio_codec = ahdr->codec;
-				st->audio_sample_rate = ahdr->fps_num;
-				st->audio_ts_type = audio_codec_to_ts(ahdr->codec);
-				st->audio_read_seq = ahdr->write_seq;
+				rsr_set_audio_params(st, ahdr);
 				rss_ring_acquire(st->audio_ring);
 				RSS_INFO("audio ring attached: codec=%u rate=%u", st->audio_codec,
 					 st->audio_sample_rate);
@@ -366,6 +380,9 @@ static void serve_loop(rsr_state_t *st)
 			s->idle_count = 0;
 			got_frame = true;
 			uint64_t pts = meta.timestamp * 9 / 100;
+			uint64_t now_us = rss_timestamp_us();
+			uint64_t frame_gap_us = s->prev_frame_us ? now_us - s->prev_frame_us : 0;
+			s->prev_frame_us = now_us;
 
 			RSS_TRACE("frame: %s len=%u key=%d pts=%" PRIu64, s->name, length,
 				  meta.is_key, pts);
@@ -389,8 +406,16 @@ static void serve_loop(rsr_state_t *st)
 
 				uint64_t vpts = c->video_pts_set ? pts - c->video_pts_base : pts;
 
-				/* PAT/PMT before keyframes */
-				if (meta.is_key) {
+				/* PAT/PMT before keyframes, and frequently enough that
+				 * a joiner never waits long for the program layout
+				 * (DVB TR 101 290 wants tables inside 500ms). PSI can
+				 * only ride a frame, so a fixed threshold quantizes to
+				 * threshold plus one frame period and grazes that
+				 * bound under load; emit when waiting for the next
+				 * frame -- predicted by the gap just observed -- would
+				 * pass the 450ms budget instead. */
+				if (meta.is_key ||
+				    now_us - c->last_pat_us + frame_gap_us >= 450000) {
 					size_t pat_len = rss_ts_write_pat_pmt(&c->ts, st->ts_buf,
 									      st->ts_buf_size);
 					if (pat_len > 0) {
@@ -399,6 +424,7 @@ static void serve_loop(rsr_state_t *st)
 							rsr_remove_client(st, ci);
 							continue;
 						}
+						c->last_pat_us = now_us;
 					}
 				}
 
@@ -439,8 +465,7 @@ static void serve_loop(rsr_state_t *st)
 					RSS_DEBUG("audio ring overflow, resetting");
 					const rss_ring_header_t *ahdr =
 						rss_ring_get_header(st->audio_ring);
-					st->audio_read_seq =
-						ahdr->write_seq > 0 ? ahdr->write_seq - 1 : 0;
+					st->audio_read_seq = ahdr->write_seq;
 					continue;
 				}
 				if (ret != 0)
@@ -458,8 +483,7 @@ static void serve_loop(rsr_state_t *st)
 
 				if (st->audio_ts_type == RSS_TS_STREAM_AAC &&
 				    alen <= sizeof(audio_buf)) {
-					build_adts_header(adts_buf, st->audio_sample_rate,
-							  (int)alen);
+					build_adts_header(adts_buf, st->audio_adts_rate, (int)alen);
 					memcpy(adts_buf + 7, audio_buf, alen);
 					adata = adts_buf;
 					adatalen = alen + 7;
@@ -604,10 +628,7 @@ int main(int argc, char **argv)
 			rss_ring_check_version(st.audio_ring, "audio");
 			const rss_ring_header_t *ahdr = rss_ring_get_header(st.audio_ring);
 
-			st.audio_codec = ahdr->codec;
-			st.audio_sample_rate = ahdr->fps_num;
-			st.audio_ts_type = audio_codec_to_ts(ahdr->codec);
-			st.audio_read_seq = ahdr->write_seq;
+			rsr_set_audio_params(&st, ahdr);
 			rss_ring_acquire(st.audio_ring);
 			RSS_INFO("audio: codec=%u rate=%u ts_type=0x%02x", st.audio_codec,
 				 st.audio_sample_rate, st.audio_ts_type);

@@ -6,7 +6,10 @@
 #   1. Build (ASAN or TSAN)
 #   2. Sibling repo tests (raptor-ipc, raptor-common)
 #   3. Unit tests (host x86, ASAN)
-#   4. Integration tests (daemons + curl/ffprobe)
+#   4. Integration tests (daemons + curl/ffprobe), then the ric
+#      behavior suite (stub rvd + fake sysfs GPIO, test-ric.sh),
+#      the rac beep suite, the pre-auth parser fuzzers, and the
+#      net-fallback suite
 #   5. Leak/race detection (lifecycle soak)
 #
 # Usage:
@@ -65,13 +68,77 @@ echo " raptor test suite ($SAN_MODE)"
 echo "========================================"
 echo ""
 
+# ── Stage 0: Hand-written JSON gate ──
+#
+# Structured formats are built by serializers, never string assembly:
+# a "%s" into a JSON literal is one edit away from injection, and the
+# safety of today's literal requires provenance reasoning no reviewer
+# should have to repeat. Production C carries exactly two documented
+# exemptions -- raptorctl_help.c prints example -j syntax (display
+# text, not construction) and raptor-ipc's transport error frame
+# (rss_ctrl.c, a dependency-free layer emitting a constant shape with
+# one integer). Anything else is a failure, not a style note.
+
+echo "=== Stage 0: Hand-written JSON gate ==="
+# Single source: the conformity hooks run this same script on staged
+# diffs and push ranges, so the rule cannot drift between suite,
+# hooks and CI.
+if "$RAPTOR_DIR/tools/conformity/json-gate.sh" --tree \
+    "$RAPTOR_DIR" "$RAPTOR_DIR/../raptor-common" "$RAPTOR_DIR/../raptor-ipc" \
+    "$RAPTOR_DIR/../raptor-hal"; then
+    stage_pass "hand-written JSON gate"
+else
+    stage_fail "hand-written JSON gate"
+    exit 1
+fi
+
 # ── Stage 1: Build ──
 
 echo "=== Stage 1: Build ($SAN_MODE) ==="
 
-if [ -f "$RAPTOR_DIR/asan-out/rsd" ] && [ -f "$RAPTOR_DIR/asan-out/create_rings" ]; then
-    echo "  binaries exist, skipping build (delete asan-out/ to force)"
-    stage_pass "build ($SAN_MODE) [cached]"
+# Reuse the tree only when it is genuinely the tree this run wants:
+# the right sanitizer, and newer than every source that feeds it. The
+# old check was bare file existence, so `--tsan` after an asan build
+# printed "[cached]" and ran asan binaries under a tsan banner, and
+# editing a daemon then running the suite tested the previous build.
+BUILD_CACHED=0
+if [ -f "$RAPTOR_DIR/asan-out/.build-ok" ] && [ -f "$RAPTOR_DIR/asan-out/rsd" ] &&
+   [ -f "$RAPTOR_DIR/asan-out/create_rings" ]; then
+    # build-asan.sh already stamps asan-out/.sanitizer (ASan/TSan) so it
+    # can clean dep libs across a switch; read that rather than writing
+    # a second stamp in a different vocabulary.
+    WANT_SAN=ASan
+    [ "$SAN_MODE" = "tsan" ] && WANT_SAN=TSan
+    HAVE_SAN=$(cat "$RAPTOR_DIR/asan-out/.sanitizer" 2>/dev/null || echo unknown)
+    if [ "$HAVE_SAN" != "$WANT_SAN" ]; then
+        echo "  asan-out/ was built with '$HAVE_SAN', this run wants '$WANT_SAN' — rebuilding"
+    else
+        # Generated sources are excluded by name (build-asan.sh writes
+        # rss_build_info.c, tests/Makefile seds sdp_parse.c out of
+        # rwd_sdp.c) -- both are rewritten every build and would pin the
+        # verdict to "stale" forever. Missing a future generated file
+        # only costs a rebuild: this check fails safe.
+        # -newer against the binary, first hit wins. No pipe into head:
+        # this script runs under `set -o pipefail`, and head closing the
+        # pipe early would abort the suite rather than answer the
+        # question.
+        NEWER=$(find "$RAPTOR_DIR" "$RAPTOR_DIR/../raptor-ipc" "$RAPTOR_DIR/../raptor-common" \
+            \( -name '*.c' -o -name '*.h' \) -newer "$RAPTOR_DIR/asan-out/rsd" \
+            -not -path '*/asan-out/*' -not -path '*/.git/*' \
+            -not -name 'rss_build_info.c' -not -name 'sdp_parse.c' \
+            -print -quit 2>/dev/null || true)
+        if [ -n "$NEWER" ]; then
+            echo "  $(basename "$NEWER") is newer than the build — rebuilding"
+        else
+            echo "  binaries current for $SAN_MODE, skipping build"
+            stage_pass "build ($SAN_MODE) [cached]"
+            BUILD_CACHED=1
+        fi
+    fi
+fi
+
+if [ "$BUILD_CACHED" = 1 ]; then
+    :
 elif [ "$SAN_MODE" = "tsan" ]; then
     if (cd "$RAPTOR_DIR" && ./build-asan.sh tsan); then
         stage_pass "build (tsan)"
@@ -130,6 +197,30 @@ if "$SCRIPT_DIR/test-integration.sh"; then
     stage_pass "integration tests"
 else
     stage_fail "integration tests"
+fi
+
+if "$SCRIPT_DIR/test-ric.sh"; then
+    stage_pass "ric behavior suite"
+else
+    stage_fail "ric behavior suite"
+fi
+
+if "$SCRIPT_DIR/test-rac.sh"; then
+    stage_pass "rac beep suite"
+else
+    stage_fail "rac beep suite"
+fi
+
+if "$SCRIPT_DIR/test-fuzz.sh"; then
+    stage_pass "fuzz (pre-auth parsers)"
+else
+    stage_fail "fuzz (pre-auth parsers)"
+fi
+
+if "$SCRIPT_DIR/test-net-fallback.sh"; then
+    stage_pass "net fallback (IPv6-first, IPv4 fallback)"
+else
+    stage_fail "net fallback (IPv6-first, IPv4 fallback)"
 fi
 
 # ── Stage 5: Leak / race detection ──

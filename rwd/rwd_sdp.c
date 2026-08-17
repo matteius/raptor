@@ -260,6 +260,16 @@ int rwd_sdp_generate_answer(rwd_client_t *c, const rwd_server_t *srv, char *buf,
 
 	(void)srv; /* video_ring not needed — we echo the browser's fmtp */
 
+	/*
+	 * Without a local address there is nothing valid to answer with: RFC 4566
+	 * requires a connection-address in c=, and RFC 8839 requires one in each
+	 * candidate. Emitting "c=IN IP4 " leaves the peer with a session that
+	 * completes signalling and never connects, which is far harder to
+	 * diagnose than a failed request.
+	 */
+	if (srv->local_ip[0] == '\0')
+		return -1;
+
 	uint32_t session_id = (uint32_t)rss_timestamp_us();
 
 #define APPEND(fmt, ...)                                                                           \
@@ -347,7 +357,12 @@ int rwd_sdp_generate_answer(rwd_client_t *c, const rwd_server_t *srv, char *buf,
 		APPEND("a=fingerprint:%s", srv->dtls->fingerprint);
 		APPEND("a=setup:passive");
 		APPEND("a=mid:%s", c->offer.mid_audio[0] ? c->offer.mid_audio : "1");
-		APPEND("a=sendrecv");
+		/* Direction states what we will actually do (RFC 3264 §6.1):
+		 * with no audio ring the media layer never creates an audio
+		 * sender for this client, so promising sendrecv advertises a
+		 * stream that never flows. recvonly keeps the backchannel
+		 * (browser mic → speaker) fully functional. */
+		APPEND("a=%s", srv->audio_ring ? "sendrecv" : "recvonly");
 		if (wc == RWD_CODEC_PCMU)
 			APPEND("a=rtpmap:0 PCMU/8000");
 		else if (wc == RWD_CODEC_PCMA)

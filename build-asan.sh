@@ -29,16 +29,26 @@ if [ "$1" = "tsan" ]; then
     shift
 fi
 
+# Flags shared with tests/Makefile so the sources both build compile
+# the same way -- see sanitizer-flags.mk.
+. "$RAPTOR_DIR/sanitizer-flags.mk"
+
 if [ "$SAN_MODE" = "tsan" ]; then
-    SANITIZE="-fsanitize=thread -fno-omit-frame-pointer"
+    SANITIZE="$RAPTOR_SAN_THREAD $RAPTOR_SAN_EXTRA"
     SAN_LABEL="TSan"
 else
-    SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+    SANITIZE="$RAPTOR_SAN_ADDRESS $RAPTOR_SAN_EXTRA"
     SAN_LABEL="ASan"
 fi
 
 OUT="$RAPTOR_DIR/asan-out"
 DEPS="$OUT/deps"
+# Completion marker: cleared while the tree is in flux, written only
+# after every binary links. A build that dies partway otherwise leaves
+# a tree that looks complete to anything checking timestamps or the
+# sanitizer stamp -- which is how a missing rsr survived into a
+# "cached" run and failed the leak stage.
+rm -f "$OUT/.build-ok"
 
 if [ "$1" = "clean" ]; then
     rm -f "$OUT"/*.o "$OUT"/*.a "$OUT"/rss_build_info.c
@@ -69,12 +79,30 @@ rm -f "$OUT"/*.o "$OUT"/rss_build_info.c
 STAMP="$OUT/.sanitizer"
 PREV_SAN=""
 [ -f "$STAMP" ] && PREV_SAN=$(cat "$STAMP")
+# No stamp but dependency libs on disk: their instrumentation cannot be
+# proven to match, and guessing wrong fails at link with a wall of
+# undefined __asan_* references. Treat it as a mismatch and rebuild.
+if [ -z "$PREV_SAN" ] && [ -n "$(find "$OUT" -name '*.a' -print -quit 2>/dev/null)" ]; then
+    PREV_SAN="unknown"
+fi
 if [ -n "$PREV_SAN" ] && [ "$PREV_SAN" != "$SAN_LABEL" ]; then
     echo "  sanitizer changed ($PREV_SAN -> $SAN_LABEL), cleaning dep libs"
-    rm -rf "$OUT"/mbedtls-build "$OUT"/mbedtls-install "$OUT"/compy-build
-    rm -f "$OUT"/schrift.o "$OUT"/*.a
+    # Every dependency built here carries the previous sanitizer's
+    # instrumentation and will not link against the new one. This was a
+    # hand-listed set and drifted: SRT and faac were added later and
+    # never added here, so switching to TSan died linking an ASan
+    # libsrt.a -- invisible while the suite's mode-blind cache served
+    # asan binaries for tsan runs. Derive the list instead of naming it.
+    find "$OUT" -name '*.a' -print0 2>/dev/null | xargs -0r rm -f
+    rm -rf "$OUT"/mbedtls-build "$OUT"/mbedtls-install "$OUT"/compy-build \
+        "$OUT"/srt-build "$OUT"/srt-install "$OUT"/faac-build
+    rm -f "$OUT"/schrift.o
 fi
-echo "$SAN_LABEL" > "$STAMP"
+# The stamp is written at the END, with .build-ok: it records what was
+# actually built, not what this run intends to build. Written here, a
+# build that died mid-switch would leave it claiming the new sanitizer
+# while the dep libs were still the old one -- so the next run saw no
+# change to make, skipped the clean, and failed the same link forever.
 
 # ── Clone/update dependencies ──
 
@@ -108,6 +136,7 @@ find_or_clone raptor-hal    https://github.com/gtxaspec/raptor-hal.git    HAL_DI
 find_or_clone compy         https://github.com/gtxaspec/compy.git         COMPY_DIR
 find_or_clone libschrift    https://github.com/tomolt/libschrift.git      SCHRIFT_DIR
 find_or_clone faac          https://github.com/knik0/faac.git             FAAC_DIR
+find_or_clone ESP8266Audio  https://github.com/earlephilhower/ESP8266Audio.git ESP8266AUDIO_DIR
 
 # Build mbedTLS from source with DTLS-SRTP enabled
 MBEDTLS_VER="3.6.6"
@@ -140,9 +169,15 @@ fi
 MBEDTLS_CFLAGS="-I$MBEDTLS_PREFIX/include"
 MBEDTLS_LIBS="$MBEDTLS_PREFIX/lib/libmbedtls.a $MBEDTLS_PREFIX/lib/libmbedx509.a $MBEDTLS_PREFIX/lib/libmbedcrypto.a"
 
-# Build compy for x86 with TLS
+# Build compy for x86 with TLS. Configure is cached; the build step
+# always runs and cmake's own dependency tracking makes it a no-op when
+# the checkout is unchanged. Gating everything on libcompy.a existing
+# froze the archive forever: an SR NTP fix landed in the sibling and
+# every asan rsd kept linking the pre-fix compy until the integration
+# suite's SR wall-clock leg read a steady 642 ms against a shared clock.
+# The same disease the target Makefile just shed for its siblings.
 COMPY_BUILD="$OUT/compy-build"
-if [ ! -f "$COMPY_BUILD/libcompy.a" ]; then
+if [ ! -f "$COMPY_BUILD/CMakeCache.txt" ]; then
     echo "=== compy (cmake + mbedTLS) ==="
     mkdir -p "$COMPY_BUILD"
     cmake -S "$COMPY_DIR" -B "$COMPY_BUILD" \
@@ -151,9 +186,8 @@ if [ ! -f "$COMPY_BUILD/libcompy.a" ]; then
         -DCOMPY_TLS_MBEDTLS=ON \
         -DCMAKE_PREFIX_PATH="$MBEDTLS_PREFIX" \
         > /dev/null 2>&1
-    cmake --build "$COMPY_BUILD" -j"$(nproc)" > /dev/null 2>&1
-    echo "  -> libcompy.a (with TLS)"
 fi
+cmake --build "$COMPY_BUILD" -j"$(nproc)" > /dev/null 2>&1
 
 # Build libsrt for x86 with mbedTLS
 SRT_VER="1.5.4"
@@ -194,7 +228,7 @@ COMPY_CFLAGS="$COMPY_CFLAGS -I$COMPY_BUILD/_deps/metalang99-src/include"
 # ── Compiler setup ──
 
 CC=gcc
-CFLAGS="-Wall -Wextra -Werror -std=gnu11 -D_GNU_SOURCE -DPLATFORM_T31 -O1 -g $SANITIZE"
+CFLAGS="-Wall -Wextra -Werror -std=$RAPTOR_STD -D_GNU_SOURCE -DPLATFORM_T31 -O1 -g $SANITIZE"
 CFLAGS="$CFLAGS -I$IPC_DIR/include -I$COMMON_DIR/include -I$COMMON_DIR/third_party/monocypher $MBEDTLS_CFLAGS"
 LDFLAGS="$SANITIZE -lpthread -lrt -lm"
 
@@ -209,11 +243,13 @@ $CC $CFLAGS -c "$COMMON_DIR/src/rss_config.c" -o "$OUT/rss_config.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/rss_daemon.c" -o "$OUT/rss_daemon.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/rss_util.c" -o "$OUT/rss_util.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/rss_ctrl_cmds.c" -o "$OUT/rss_ctrl_common.o"
+$CC $CFLAGS -c "$COMMON_DIR/src/rss_ctrl_client.c" -o "$OUT/rss_ctrl_client.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/rss_http.c" -o "$OUT/rss_http.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/rss_ts.c" -o "$OUT/rss_ts.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/rss_sei.c" -o "$OUT/rss_sei.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/rss_sign.c" -o "$OUT/rss_sign.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/rss_jpeg.c" -o "$OUT/rss_jpeg.o"
+$CC $CFLAGS -c "$COMMON_DIR/src/rss_aac.c" -o "$OUT/rss_aac.o"
 $CC $CFLAGS -c "$COMMON_DIR/third_party/monocypher/monocypher.c" -o "$OUT/monocypher.o"
 $CC $CFLAGS -c "$COMMON_DIR/third_party/monocypher/monocypher-ed25519.c" -o "$OUT/monocypher-ed25519.o"
 $CC $CFLAGS -c "$COMMON_DIR/src/cJSON.c" -o "$OUT/cJSON.o"
@@ -223,7 +259,7 @@ const char *rss_build_time = "asan-build";
 const char *rss_build_platform = "x86_64";
 BUILDEOF
 $CC $CFLAGS -c "$OUT/rss_build_info.c" -o "$OUT/rss_build_info.o"
-ar rcs "$OUT/librss_common.a" "$OUT"/rss_log.o "$OUT"/rss_config.o "$OUT"/rss_daemon.o "$OUT"/rss_util.o "$OUT"/rss_ctrl_common.o "$OUT"/rss_http.o "$OUT"/rss_ts.o "$OUT"/rss_sei.o "$OUT"/rss_sign.o "$OUT"/rss_jpeg.o "$OUT"/monocypher.o "$OUT"/monocypher-ed25519.o "$OUT"/cJSON.o
+ar rcs "$OUT/librss_common.a" "$OUT"/rss_log.o "$OUT"/rss_config.o "$OUT"/rss_daemon.o "$OUT"/rss_util.o "$OUT"/rss_ctrl_common.o "$OUT"/rss_ctrl_client.o "$OUT"/rss_http.o "$OUT"/rss_ts.o "$OUT"/rss_sei.o "$OUT"/rss_sign.o "$OUT"/rss_jpeg.o "$OUT"/rss_aac.o "$OUT"/monocypher.o "$OUT"/monocypher-ed25519.o "$OUT"/cJSON.o
 
 echo "=== raptor-ipc ==="
 $CC $CFLAGS -c "$IPC_DIR/src/rss_ring.c" -o "$OUT/rss_ring.o"
@@ -239,7 +275,9 @@ ar rcs "$OUT/libmock_hal.a" "$OUT/mock_hal.o"
 echo "=== rss_tls ==="
 $CC $CFLAGS $TLS_CFLAGS -c "$COMMON_DIR/src/rss_tls.c" -o "$OUT/rss_tls.o"
 
-LIBS="$OUT/librss_ipc.a $OUT/librss_common.a $OUT/rss_build_info.o"
+# common before ipc: librss_common's ctrl-client helpers call into
+# librss_ipc, and a static archive is only scanned once left-to-right.
+LIBS="$OUT/librss_common.a $OUT/librss_ipc.a $OUT/rss_build_info.o"
 LIBS_HAL="$OUT/libmock_hal.a $LIBS"
 LIBS_TLS="$OUT/rss_tls.o $MBEDTLS_LIBS"
 
@@ -253,18 +291,46 @@ $CC -o "$OUT/rhd" "$OUT/rhd_main.o" "$OUT/rhd_http.o" "$OUT/rhd_audio.o" $LIBS $
 echo "  -> rhd"
 
 echo "=== RSD ==="
-$CC $CFLAGS $COMPY_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_main.c" -o "$OUT/rsd_main.o"
-$CC $CFLAGS $COMPY_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_server.c" -o "$OUT/rsd_server.o"
-$CC $CFLAGS $COMPY_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_session.c" -o "$OUT/rsd_session.o"
-$CC $CFLAGS $COMPY_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_ring_reader.c" -o "$OUT/rsd_ring_reader.o"
-$CC -o "$OUT/rsd" "$OUT"/rsd_main.o "$OUT"/rsd_server.o "$OUT"/rsd_session.o "$OUT"/rsd_ring_reader.o $LIBS "$COMPY_BUILD/libcompy.a" $MBEDTLS_LIBS $LDFLAGS
+# Helix AAC decoder (vendored inside ESP8266Audio) for the backchannel
+# AAC path. Same from-clone treatment as libfaac below; the Arduino
+# headers it expects are stubbed away, and it compiles under the
+# sanitizers on purpose -- this decoder eats network data.
+HELIX_AAC_DIR="$ESP8266AUDIO_DIR/src/libhelix-aac"
+HELIX_BUILD="$OUT/helix-aac-build"
+if [ ! -f "$HELIX_BUILD/libhelix-aac.a" ]; then
+    echo "=== libhelix-aac (from clone) ==="
+    mkdir -p "$HELIX_BUILD/stubs"
+    printf '%s\n' '#ifndef PGMSPACE_H' '#define PGMSPACE_H' '#include <stdint.h>' \
+        '#include <string.h>' '#define PROGMEM' '#define PGM_P const char *' \
+        '#define pgm_read_byte(x) (*(const uint8_t *)(x))' \
+        '#define pgm_read_word(x) (*(const uint16_t *)(x))' \
+        '#define pgm_read_dword(x) (*(const uint32_t *)(x))' \
+        '#define memcpy_P memcpy' '#endif' > "$HELIX_BUILD/stubs/pgmspace.h"
+    printf '%s\n' '#ifndef ARDUINO_H' '#define ARDUINO_H' '#include <stdint.h>' \
+        '#include "pgmspace.h"' '#endif' > "$HELIX_BUILD/stubs/Arduino.h"
+    for f in "$HELIX_AAC_DIR"/*.c; do
+        $CC $CFLAGS -w -DUSE_DEFAULT_STDLIB -I"$HELIX_BUILD/stubs" -I"$HELIX_AAC_DIR" -fPIC \
+            -c "$f" -o "$HELIX_BUILD/$(basename "${f%.c}").o"
+    done
+    ar rcs "$HELIX_BUILD/libhelix-aac.a" "$HELIX_BUILD"/*.o
+    echo "  -> libhelix-aac.a"
+fi
+RSD_CODEC_CFLAGS="-DRAPTOR_OPUS -DRAPTOR_AAC -I$HELIX_AAC_DIR"
+$CC $CFLAGS $COMPY_CFLAGS $RSD_CODEC_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_main.c" -o "$OUT/rsd_main.o"
+$CC $CFLAGS $COMPY_CFLAGS $RSD_CODEC_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_server.c" -o "$OUT/rsd_server.o"
+$CC $CFLAGS $COMPY_CFLAGS $RSD_CODEC_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_session.c" -o "$OUT/rsd_session.o"
+$CC $CFLAGS $COMPY_CFLAGS $RSD_CODEC_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_ring_reader.c" -o "$OUT/rsd_ring_reader.o"
+$CC $CFLAGS $COMPY_CFLAGS $RSD_CODEC_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_sendq.c" -o "$OUT/rsd_sendq.o"
+$CC $CFLAGS $COMPY_CFLAGS $RSD_CODEC_CFLAGS -c "$RAPTOR_DIR/rsd/rsd_backchannel.c" -o "$OUT/rsd_backchannel.o"
+$CC -o "$OUT/rsd" "$OUT"/rsd_main.o "$OUT"/rsd_server.o "$OUT"/rsd_session.o "$OUT"/rsd_ring_reader.o "$OUT"/rsd_sendq.o "$OUT"/rsd_backchannel.o $LIBS "$COMPY_BUILD/libcompy.a" $MBEDTLS_LIBS -lopus "$HELIX_BUILD/libhelix-aac.a" $LDFLAGS
 echo "  -> rsd"
 
 echo "=== RIC ==="
 $CC $CFLAGS -c "$RAPTOR_DIR/ric/ric_main.c" -o "$OUT/ric_main.o"
+$CC $CFLAGS -c "$RAPTOR_DIR/ric/ric_json.c" -o "$OUT/ric_json.o"
 $CC $CFLAGS -c "$RAPTOR_DIR/ric/ric_daynight.c" -o "$OUT/ric_daynight.o"
 $CC $CFLAGS -c "$RAPTOR_DIR/ric/ric_photo.c" -o "$OUT/ric_photo.o"
-$CC -o "$OUT/ric" "$OUT/ric_main.o" "$OUT/ric_daynight.o" "$OUT/ric_photo.o" $LIBS $LDFLAGS
+$CC -o "$OUT/ric" "$OUT/ric_main.o" "$OUT/ric_json.o" "$OUT/ric_daynight.o" "$OUT/ric_photo.o" $LIBS $LDFLAGS
 echo "  -> ric"
 
 echo "=== RMD ==="
@@ -306,15 +372,17 @@ $CC $CFLAGS -c "$RAPTOR_DIR/rmr/rmr_nal.c" -o "$OUT/rmr_nal.o"
 $CC $CFLAGS -c "$RAPTOR_DIR/rmr/rmr_prebuf.c" -o "$OUT/rmr_prebuf.o"
 $CC $CFLAGS -c "$RAPTOR_DIR/rmr/rmr_sign.c" -o "$OUT/rmr_sign.o"
 $CC $CFLAGS -c "$RAPTOR_DIR/rmr/rmr_storage.c" -o "$OUT/rmr_storage.o"
-$CC -o "$OUT/rmr" "$OUT"/rmr_main.o "$OUT"/rmr_mux.o "$OUT"/rmr_nal.o "$OUT"/rmr_prebuf.o "$OUT"/rmr_sign.o "$OUT"/rmr_storage.o $LIBS $LDFLAGS
+$CC $CFLAGS -c "$RAPTOR_DIR/rmr/rmr_timelapse.c" -o "$OUT/rmr_timelapse.o"
+$CC -o "$OUT/rmr" "$OUT"/rmr_main.o "$OUT"/rmr_mux.o "$OUT"/rmr_nal.o "$OUT"/rmr_prebuf.o "$OUT"/rmr_sign.o "$OUT"/rmr_storage.o "$OUT"/rmr_timelapse.o $LIBS $LDFLAGS
 echo "  -> rmr"
 
 echo "=== RSP ==="
-RSP_CFLAGS="$TLS_CFLAGS -I$RAPTOR_DIR/rmr"
+RSP_CFLAGS="$TLS_CFLAGS $COMPY_CFLAGS -I$RAPTOR_DIR/rmr"
 $CC $CFLAGS $RSP_CFLAGS -c "$RAPTOR_DIR/rsp/rsp_main.c" -o "$OUT/rsp_main.o"
 $CC $CFLAGS $RSP_CFLAGS -c "$RAPTOR_DIR/rsp/rsp_rtmp.c" -o "$OUT/rsp_rtmp.o"
 $CC $CFLAGS $RSP_CFLAGS -c "$RAPTOR_DIR/rsp/rsp_audio.c" -o "$OUT/rsp_audio.o"
-$CC -o "$OUT/rsp" "$OUT"/rsp_main.o "$OUT"/rsp_rtmp.o "$OUT"/rsp_audio.o "$OUT"/rmr_nal.o $LIBS $LIBS_TLS $LDFLAGS
+$CC $CFLAGS $RSP_CFLAGS -c "$RAPTOR_DIR/rsp/rsp_net.c" -o "$OUT/rsp_net.o"
+$CC -o "$OUT/rsp" "$OUT"/rsp_main.o "$OUT"/rsp_rtmp.o "$OUT"/rsp_audio.o "$OUT"/rsp_net.o "$OUT"/rmr_nal.o $LIBS "$COMPY_BUILD/libcompy.a" $MBEDTLS_LIBS $LIBS_TLS $LDFLAGS
 echo "  -> rsp"
 
 echo "=== RSR ==="
@@ -370,11 +438,13 @@ if [ ! -f "$FAAC_BUILD/libfaac.a" ]; then
         '#define HAVE_SYS_TYPES_H 1' \
         '#define HAVE_STRCASECMP 1' \
         '#define FAAC_PRECISION_SINGLE 1' \
+        '#define FAAC_SBR_DECIMATION 1' \
         '#define MAX_CHANNELS 2' \
         > "$FAAC_BUILD/config.h"
-    FAAC_SRCS="bitstream.c blockswitch.c channels.c cpu_compute.c fft.c \
-               filtbank.c frame.c huff2.c huffdata.c quantize.c stereo.c \
-               tns.c util.c"
+    # Every libfaac source: the hand list predated the new faac_encoder
+    # API (faac.c) and SBR, and drifted exactly the way the comment
+    # above warns.
+    FAAC_SRCS=$(cd "$FAAC_DIR/libfaac" && ls *.c)
     # -w silences upstream libfaac warnings (sign-compare, unused-parameter,
     # missing-field-initializers). Not our code to fix.
     for f in $FAAC_SRCS; do
@@ -388,10 +458,10 @@ fi
 FAAC_CFLAGS="-I$FAAC_DIR/include"
 FAAC_LIBS="$FAAC_BUILD/libfaac.a"
 
-for f in rad_main.c rad_codec.c rad_codec_g711.c rad_codec_l16.c rad_codec_aac.c rad_codec_opus.c; do
-  $CC $CFLAGS $HAL_CFLAGS $FAAC_CFLAGS -c "$RAPTOR_DIR/rad/$f" -o "$OUT/${f%.c}.o"
+for f in rad_main.c rad_clock.c rad_resync.c rad_codec.c rad_codec_g711.c rad_codec_l16.c rad_codec_aac.c rad_codec_opus.c; do
+  $CC $CFLAGS $HAL_CFLAGS $FAAC_CFLAGS -DRAPTOR_AAC -DRAPTOR_OPUS -c "$RAPTOR_DIR/rad/$f" -o "$OUT/${f%.c}.o"
 done
-$CC -o "$OUT/rad" "$OUT"/rad_main.o "$OUT"/rad_codec.o "$OUT"/rad_codec_g711.o \
+$CC -o "$OUT/rad" "$OUT"/rad_main.o "$OUT"/rad_clock.o "$OUT"/rad_resync.o "$OUT"/rad_codec.o "$OUT"/rad_codec_g711.o \
     "$OUT"/rad_codec_l16.o "$OUT"/rad_codec_aac.o "$OUT"/rad_codec_opus.o \
     $LIBS_HAL $FAAC_LIBS -lopus $LDFLAGS
 echo "  -> rad"
@@ -433,6 +503,9 @@ $CC -o "$OUT/rwd" "$OUT"/rwd_main.o "$OUT"/rwd_signaling.o "$OUT"/rwd_sdp.o \
     "$OUT"/rwd_ice.o "$OUT"/rwd_dtls.o "$OUT"/rwd_media.o "$OUT"/rwd_webtorrent.o \
     $LIBS "$COMPY_BUILD/libcompy.a" $LIBS_TLS -lopus $LDFLAGS
 echo "  -> rwd"
+
+echo "$SAN_LABEL" > "$STAMP"
+touch "$OUT/.build-ok"
 
 echo ""
 echo "Done. All binaries in asan-out/"
