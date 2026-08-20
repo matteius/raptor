@@ -104,7 +104,7 @@ const struct help_entry help_entries[] = {
 	{"rad", "ai-disable                          Disable audio input pipeline"},
 	{"rad", "ai-enable                           Enable audio input pipeline"},
 	{"rad", "set-aec <0|1>                        Acoustic echo cancellation"},
-	{"rad", "set-ns <0|1> [0-3]                  Noise suppression level"},
+	{"rad", "set-ns <0|1> [0-4]                  NS level (4=music/video)"},
 	{"rad", "set-hpf <0|1>                       High-pass filter"},
 	{"rad", "set-agc <0|1> [target] [comp]       Automatic gain control"},
 	{"rad", "ao-set-volume <val>                 Speaker volume"},

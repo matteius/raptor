@@ -215,7 +215,7 @@ static int rad_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 		if (rss_json_get_int(cmd_json, "value", &val) == 0) {
 			int ret = RSS_OK;
 			if (val && !ctx->ns_enabled) {
-				if (level < RSS_NS_LOW || level > RSS_NS_VERYHIGH)
+				if (level < RSS_NS_LOW || level > RSS_NS_MUSIC)
 					level = RSS_NS_MODERATE;
 				ret = RSS_HAL_CALL(ctx->ops, audio_enable_ns, ctx->hal_ctx,
 						   (rss_ns_level_t)level);
@@ -1155,7 +1155,7 @@ int main(int argc, char **argv)
 	bool ns_enabled = rss_config_get_bool(dctx.cfg, "audio", "ns_enabled", false);
 	if (ns_enabled) {
 		int ns_level = rss_config_get_int(dctx.cfg, "audio", "ns_level", RSS_NS_MODERATE);
-		if (ns_level < RSS_NS_LOW || ns_level > RSS_NS_VERYHIGH)
+		if (ns_level < RSS_NS_LOW || ns_level > RSS_NS_MUSIC)
 			ns_level = RSS_NS_MODERATE;
 		ret = RSS_HAL_CALL(ops, audio_enable_ns, hal_ctx, (rss_ns_level_t)ns_level);
 		if (ret == RSS_OK)
