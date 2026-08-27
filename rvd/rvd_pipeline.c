@@ -336,7 +336,8 @@ static int rvd_pipeline_init_v4l2(rvd_state_t *st)
 	if (sensor_fps <= 0)
 		sensor_fps = 25;
 
-	load_stream_config(st->cfg, "stream0", stream, sensor_w, sensor_h, sensor_fps, 8000000);
+	/* Keep the V4L2 fallback aligned with the documented stream0 default. */
+	load_stream_config(st->cfg, "stream0", stream, sensor_w, sensor_h, sensor_fps, 3000000);
 	stream->fs_chn = 0;
 	stream->chn = 0;
 	stream->sensor_idx = 0;
