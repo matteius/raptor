@@ -1149,7 +1149,7 @@ def scenario_zero_exposure(stub, watch):
         "zero exposure holds mode (no phantom night)",
         str(modes),
     )
-    warns = len(re.findall(r"WARN.*no exposure data", ric.read_log()))
+    warns = len(re.findall(r"WARN.*no valid gain, luma or ev data", ric.read_log()))
     result(warns == 1, "zero exposure warns exactly once", "warns=%d" % warns)
     # Manual override must still work on such platforms.
     gm = watch.mark()
