@@ -712,7 +712,10 @@ def scenario_covered_lens_baseline(stub, watch):
     # Re-cover: dark again, normal dusk returns night.
     mm4 = stub.mark()
     stub.set_scene(luma=8, gain=44002, ev=242354)
-    ok = wait_for(lambda: "night" in stub.modes_since(mm4), 5)
+    # A NIGHT -> DAY switch arms the 15-second false-EV-plateau guard.
+    # This sample is deliberately below the independent night-gain proof,
+    # so exercise the guarded path instead of racing it with the old timeout.
+    ok = wait_for(lambda: "night" in stub.modes_since(mm4), 20)
     result(ok, "covered-lens: re-cover returns to night", str(stub.modes_since(mm4)))
     ric.stop()
 
@@ -2050,7 +2053,8 @@ def scenario_night_fps(stub, watch):
     # re-apply the night rate -- a restarted rvd is at its boot rate.
     fm = stub.fps_mark()
     stub.set_scene(luma=5, gain=20000, ev=100000)
-    if not wait_for(lambda: 12 in stub.fps_since(fm), 6):
+    # As above, this low-gain sample takes the post-DAY guarded route.
+    if not wait_for(lambda: 12 in stub.fps_since(fm), 20):
         result(False, "night-fps: night re-entry", str(stub.fps_since(fm)))
         ric.stop()
         return

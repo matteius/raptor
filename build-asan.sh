@@ -216,6 +216,7 @@ if [ ! -f "$SRT_PREFIX/lib/libsrt.a" ]; then
     echo "=== libsrt $SRT_VER (cmake + mbedTLS) ==="
     mkdir -p "$SRT_BUILD"
     cmake -S "$SRT_DIR" -B "$SRT_BUILD" \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_C_FLAGS="$SANITIZE -O1 -g" \
         -DCMAKE_CXX_FLAGS="$SANITIZE -O1 -g" \
         -DCMAKE_BUILD_TYPE=Debug \

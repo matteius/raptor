@@ -806,6 +806,7 @@ build_libsrt() {
     local enc_flags="-DUSE_ENCLIB=$enclib"
     [ -z "$enclib" ] && enc_flags="-DENABLE_ENCRYPTION=OFF"
     run libsrt-cmake cmake "$src" \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_C_COMPILER="${CROSS_COMPILE}gcc" \
         -DCMAKE_CXX_COMPILER="${CROSS_COMPILE}g++" \
         -DCMAKE_SYSTEM_NAME=Linux \
