@@ -275,6 +275,7 @@ static int rvd_pipeline_init_v4l2(rvd_state_t *st)
 	int sensor_fps;
 	int sensor_proc_idx;
 	bool sensor_fps_known;
+	int requested_sensor_fps;
 	int ret;
 
 	device = rss_config_get_str(st->cfg, "system", "video_device", "/dev/video0");
@@ -316,6 +317,46 @@ static int rvd_pipeline_init_v4l2(rvd_state_t *st)
 		return ret;
 	}
 	st->hal_initialized = true;
+	sensor_fps = 0;
+	sensor_fps_known = false;
+
+	/* The public V4L2 node has no framesource decimator, so its stream rate
+	 * must follow the physical sensor. Defaults remain read-only: only an
+	 * explicit sensor.fps asks the HAL to change hardware timing. Confirm
+	 * the resulting rate when the backend can report it and use that value
+	 * for encoder RC, GOP, ring metadata and downstream clocks. */
+	requested_sensor_fps = rss_config_get_int(st->cfg, "sensor", "fps", 0);
+	if (requested_sensor_fps > 0 && requested_sensor_fps <= 120) {
+		ret = RSS_HAL_CALL(st->ops, isp_set_sensor_fps, st->hal_ctx,
+				   (uint32_t)requested_sensor_fps, 1);
+		if (ret == RSS_OK) {
+			uint32_t num = 0;
+			uint32_t den = 0;
+
+			if (RSS_HAL_CALL(st->ops, isp_get_sensor_fps, st->hal_ctx, &num, &den) ==
+				    RSS_OK &&
+			    num > 0 && den > 0) {
+				sensor_fps = (int)((num + den / 2) / den);
+				if (sensor_fps != requested_sensor_fps)
+					RSS_WARN(
+						"V4L2 sensor rate requested %d/1, hardware reports "
+						"%d/1",
+						requested_sensor_fps, sensor_fps);
+			} else {
+				sensor_fps = requested_sensor_fps;
+			}
+			sensor_fps_known = true;
+			RSS_INFO("V4L2 sensor rate set to %d/1", sensor_fps);
+		} else {
+			RSS_WARN("V4L2 sensor rate %d/1 not applied: %d; using the active rate",
+				 requested_sensor_fps, ret);
+		}
+	} else if (requested_sensor_fps < 0 || requested_sensor_fps > 120) {
+		RSS_WARN("ignoring invalid sensor.fps=%d (expected 1..120)", requested_sensor_fps);
+	}
+
+	/* Apply anti-flicker and the remaining ISP controls after any timing
+	 * change so their exposure planners see the final sensor geometry. */
 	apply_primary_isp_tuning(st, st->cfg, false);
 
 	sensor_proc_idx = find_active_sensor_proc_index();
@@ -329,10 +370,12 @@ static int rvd_pipeline_init_v4l2(rvd_state_t *st)
 		RSS_WARN("could not determine active sensor resolution; using %dx%d", sensor_w,
 			 sensor_h);
 	}
-	sensor_fps = read_sensor_proc_int(sensor_proc_idx, "max_fps", 10, 0);
-	if (sensor_fps <= 0)
-		sensor_fps = read_sensor_proc_int(sensor_proc_idx, "fps", 10, 0);
-	sensor_fps_known = sensor_fps > 0;
+	if (!sensor_fps_known) {
+		sensor_fps = read_sensor_proc_int(sensor_proc_idx, "max_fps", 10, 0);
+		if (sensor_fps <= 0)
+			sensor_fps = read_sensor_proc_int(sensor_proc_idx, "fps", 10, 0);
+		sensor_fps_known = sensor_fps > 0;
+	}
 	if (sensor_fps <= 0)
 		sensor_fps = 25;
 
@@ -349,11 +392,8 @@ static int rvd_pipeline_init_v4l2(rvd_state_t *st)
 
 	/*
 	 * The public V4L2 node emits every frame produced by the active sensor;
-	 * it has no IMP framesource decimator.  Keep encoder rate control, GOP
-	 * defaults, ring metadata and downstream RTP on that measured clock.
-	 * Reprogramming the physical sensor here is unsafe: some sensor drivers
-	 * advertise the generic FPS control but cannot switch modes while the
-	 * ISP pipeline is active.
+	 * it has no IMP framesource decimator. Keep encoder rate control, GOP
+	 * defaults, ring metadata and downstream RTP on the confirmed clock.
 	 */
 	if (sensor_fps_known &&
 	    (stream->enc_cfg.fps_num != (uint32_t)sensor_fps || stream->enc_cfg.fps_den != 1)) {
