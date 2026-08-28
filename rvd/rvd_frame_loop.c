@@ -102,6 +102,11 @@ void *rvd_encoder_thread(void *arg)
 		RSS_DEBUG("jpeg chn %d: pulsed receive every %lld ms", s->chn,
 			  (long long)(pulse_interval_us / 1000));
 	bool had_readers = false; /* pulse pacing applies to held demand only */
+	/* The source frame counter stamped into the ring: the encoder's own
+	 * sequence for video channels, so consumers can split source loss
+	 * from ring overflow. JPEG channels pass none: pulse and on-demand
+	 * duty-cycling skip source frames by design, and a designed gap
+	 * must not read as loss. */
 
 	while (rss_running(st->running) && atomic_load(&st->stream_active[idx])) {
 		/* JPEG on-demand: start/stop encoder based on ring consumers */
@@ -296,11 +301,14 @@ void *rvd_encoder_thread(void *arg)
 
 			ret = rss_ring_publish_ref(s->ring, rmem_off, (uint32_t)total_len64,
 						   frame.timestamp, primary_nal_type(&frame),
-						   frame.is_key ? 1 : 0, buf_idx);
+						   frame.is_key ? 1 : 0, buf_idx,
+						   s->is_jpeg ? RSS_SRC_SEQ_NONE : frame.seq);
 			if (ret != 0) {
 				/* A rejected publish is a dropped frame the ring
 				 * never saw; if it is a keyframe, every client in
 				 * the keyframe hold starves until the next one. */
+				if (!s->is_jpeg)
+					rss_ring_report_drop(s->ring, frame.seq);
 				int64_t now_us = rss_timestamp_us();
 				if (now_us - last_pub_warn_us > 5000000) {
 					last_pub_warn_us = now_us;
@@ -324,8 +332,11 @@ void *rvd_encoder_thread(void *arg)
 				iov[n].length = frame.nals[n].length;
 			}
 			ret = rss_ring_publish_iov(s->ring, iov, cnt, frame.timestamp,
-						   primary_nal_type(&frame), frame.is_key ? 1 : 0);
+						   primary_nal_type(&frame), frame.is_key ? 1 : 0,
+						   s->is_jpeg ? RSS_SRC_SEQ_NONE : frame.seq);
 			if (ret != 0) {
+				if (!s->is_jpeg)
+					rss_ring_report_drop(s->ring, frame.seq);
 				int64_t now_us = rss_timestamp_us();
 				if (now_us - last_pub_warn_us > 5000000) {
 					last_pub_warn_us = now_us;
