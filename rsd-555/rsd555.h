@@ -185,6 +185,10 @@ typedef struct {
 	pthread_mutex_t sources_lock;
 } rsd555_audio_ctx_t;
 
+/* True when rtsp.out_buffer_size pinned one explicit sink buffer
+ * size; the subsessions then leave OutPacketBuffer::maxSize alone. */
+int rsd555_obuf_pinned(void);
+
 /* Source registration — called by FramedSource constructor/destructor */
 int rsd555_video_add_source(rsd555_video_ctx_t *ctx, rsd555_frame_queue_t *q);
 void rsd555_video_remove_source(rsd555_video_ctx_t *ctx, rsd555_frame_queue_t *q);

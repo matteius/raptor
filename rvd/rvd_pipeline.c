@@ -316,8 +316,13 @@ static void load_stream_config(rss_config_t *cfg, const char *section, rvd_strea
 		.pixfmt = RSS_PIXFMT_NV12,
 		.fps_num = fps,
 		.fps_den = 1,
-		.nr_vbs = rss_config_get_int(cfg, section, "nr_vbs", 2),
+		.nr_vbs = rss_config_get_int(cfg, section, "nr_vbs", -1),
 	};
+	/* No configured value: default to 2 and allow the runtime
+	 * single-buffer fallback; an explicit value is trusted as-is. */
+	s->nr_vbs_auto = (s->fs_cfg.nr_vbs <= 0);
+	if (s->nr_vbs_auto)
+		s->fs_cfg.nr_vbs = 2;
 
 	/* Encoder config */
 	s->enc_cfg = (rss_video_config_t){
@@ -445,6 +450,37 @@ static void get_ring_name(int sensor_idx, const char *type, char *buf, size_t le
 		snprintf(buf, len, "s%d_%s", sensor_idx, type);
 }
 
+/*
+ * clamp_ring_slots -- force a configured slot count into what the ring accepts.
+ *
+ * rss_ring_create takes a power-of-two count no greater than
+ * RSS_RING_MAX_SLOTS and rejects everything else by returning NULL, which
+ * reaches the caller as a fatal "failed to create ring <name>" naming neither
+ * the key nor the constraint. Round instead, and name both.
+ *
+ * Down rather than up, so a fixed-up value never costs more memory than the
+ * one that was asked for -- these boards are sized to their rings.
+ */
+static int clamp_ring_slots(int slots, const char *key)
+{
+	int orig = slots;
+	int pow2 = 1;
+
+	if (slots < 2)
+		slots = 2;
+	if (slots > RSS_RING_MAX_SLOTS)
+		slots = RSS_RING_MAX_SLOTS;
+
+	while (pow2 * 2 <= slots)
+		pow2 *= 2;
+
+	if (pow2 != orig)
+		RSS_WARN("[ring] %s = %d is not a power of two in 2..%d, using %d", key, orig,
+			 RSS_RING_MAX_SLOTS, pow2);
+
+	return pow2;
+}
+
 /* OSD pool sizing callback — estimates per-element region bytes */
 struct osd_pool_ctx {
 	rss_config_t *cfg;
@@ -512,6 +548,26 @@ int rvd_pipeline_init(rvd_state_t *st)
 {
 	rss_config_t *cfg = st->cfg;
 	int ret;
+
+	/* The ISP hands the encoder BT.601 full-range YUV (its CSC boot
+	 * default; nothing here reprograms it), but the SPS VUI the
+	 * encoder emits declares limited-range BT.709. Parse the
+	 * correction knobs once here; the encoder threads apply them. */
+	st->vui_full_range = rss_config_get_bool(cfg, "system", "vui_full_range", true);
+	const char *vm = rss_config_get_str(cfg, "system", "vui_matrix", "smpte170m");
+	if (strcasecmp(vm, "smpte170m") == 0 || strcasecmp(vm, "bt601") == 0)
+		st->vui_matrix = 6;
+	else if (strcasecmp(vm, "bt470bg") == 0)
+		st->vui_matrix = 5;
+	else if (strcasecmp(vm, "bt709") == 0)
+		st->vui_matrix = 1;
+	else if (strcasecmp(vm, "unspecified") == 0)
+		st->vui_matrix = 2;
+	else {
+		if (strcasecmp(vm, "keep") != 0)
+			RSS_WARN("system.vui_matrix '%s' unknown, keeping the encoder's value", vm);
+		st->vui_matrix = -1;
+	}
 
 	pthread_mutex_init(&st->osd_lock, NULL);
 	for (int i = 0; i < RVD_MAX_STREAMS; i++)
@@ -1502,8 +1558,17 @@ create_ring:
 			const char *type = is_main ? "main" : "sub";
 			get_ring_name(s->sensor_idx, type, ring_name, sizeof(ring_name));
 
-			int slots_cfg = rss_config_get_int(
-				cfg, "ring", is_main ? "main_slots" : "sub_slots", 32);
+			const char *slots_key = is_main ? "main_slots" : "sub_slots";
+			int slots_cfg = rss_config_get_int(cfg, "ring", slots_key, 32);
+			/*
+			 * rss_ring_create takes only a power-of-two slot count, and
+			 * signals a bad one by returning NULL -- which arrives here as
+			 * a fatal "failed to create ring". A config typo should not
+			 * stop the daemon at startup with an error naming the wrong
+			 * thing, so fix it up and say exactly what was done. Rounding
+			 * down keeps the footprint at or under what was asked for.
+			 */
+			slots_cfg = clamp_ring_slots(slots_cfg, slots_key);
 			int mb_cfg = rss_config_get_int(
 				cfg, "ring", is_main ? "main_data_mb" : "sub_data_mb", 0);
 			uint32_t min_data = is_main ? (256 * 1024) : (128 * 1024);
@@ -1530,10 +1595,25 @@ create_ring:
 				uint32_t fps = s->enc_cfg.fps_num;
 				if (fps == 0)
 					fps = 25;
-				/* I-frame headroom: 4x for normal GOP, 8x for
-				 * short GOP where every frame is an I-frame */
+				/*
+				 * I-frame headroom. The data region has to hold
+				 * `slots` frames, and an I-frame is bigger than the
+				 * bitrate's per-frame average; 4x covers that.
+				 *
+				 * 8x is meant for an all-intra stream, where every
+				 * frame carries a whole picture. The test for that
+				 * used to be `gop <= fps`, which is true of the
+				 * default config rather than of an unusual one: gop
+				 * is normally unset and defaults to fps in
+				 * load_stream_config, and a one-second GOP is an
+				 * ordinary GOP. So every board took the 8x branch and
+				 * sized every ring at twice what it needed -- 3.2MB
+				 * instead of 1.6MB for a 3Mbps main stream, out of a
+				 * /dev/shm that on a 64MB board shares ~27MB with
+				 * everything else. Ask for what the branch says.
+				 */
 				uint32_t gop = s->enc_cfg.gop_length;
-				uint32_t iframe_mult = (gop > 0 && gop <= fps) ? 8 : 4;
+				uint32_t iframe_mult = (gop > 0 && gop <= 2) ? 8 : 4;
 				uint32_t max_frame =
 					(uint32_t)((uint64_t)bps * iframe_mult / 8 / fps);
 				if (max_frame < min_frame)
@@ -1694,6 +1774,8 @@ void rvd_stream_deinit(rvd_state_t *st, int idx)
 int rvd_stream_start(rvd_state_t *st, int idx)
 {
 	rvd_stream_t *s = &st->streams[idx];
+
+	s->started_us = rss_timestamp_us();
 
 	/* JPEG on-demand: don't enable FS (shares with video) or start
 	 * encoder here — the encoder thread handles start/stop based on

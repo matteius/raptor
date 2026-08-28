@@ -703,8 +703,13 @@ static void server_run(rhd_server_t *srv)
 				int ret = rss_ring_read(srv->jpeg_rings[j], &srv->jpeg_read_seqs[j],
 							srv->frame_buf, srv->frame_buf_size, &len,
 							&meta);
-				if (ret == RSS_EOVERFLOW && srv->jpeg_read_seqs[j] > 0) {
-					srv->jpeg_read_seqs[j]--;
+				if (ret == RSS_EOVERFLOW) {
+					/* Fell behind: the overflow return parked
+					 * read_seq at the newest complete frame,
+					 * which is safe to read directly. Stepping
+					 * back one instead handed cold clients a
+					 * stale frame whose arena bytes the new
+					 * session was already overwriting. */
 					ret = rss_ring_read(srv->jpeg_rings[j],
 							    &srv->jpeg_read_seqs[j], srv->frame_buf,
 							    srv->frame_buf_size, &len, &meta);
@@ -839,6 +844,12 @@ static void server_run(rhd_server_t *srv)
 					continue;
 				}
 				c->fd = cfd;
+				{
+					struct timespec ts;
+					clock_gettime(CLOCK_MONOTONIC, &ts);
+					c->recv_start =
+						(int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+				}
 				memcpy(&c->addr, &sa, sizeof(c->addr));
 #ifdef RSS_HAS_TLS
 				c->srv_tls = srv->tls;
@@ -922,15 +933,24 @@ static void server_run(rhd_server_t *srv)
 			}
 		}
 
-		/* Reap stalled async sends */
+		/* Reap stalled async sends and clients still owing a request */
 		{
 			struct timespec ts;
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			int64_t now = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 			for (int i = srv->client_count - 1; i >= 0; i--) {
 				rhd_client_t *c = srv->clients[i];
-				if (c->send_buf && (now - c->send_start) > RHD_SEND_TIMEOUT_MS)
+				if (c->send_buf && (now - c->send_start) > RHD_SEND_TIMEOUT_MS) {
 					remove_client(srv, i);
+					continue;
+				}
+				if (rhd_client_recv_expired(c, now)) {
+					char addrstr[INET6_ADDRSTRLEN];
+					client_addr_str(&c->addr, addrstr, sizeof(addrstr));
+					RSS_WARN("dropped %s:%u (no request within %d ms)", addrstr,
+						 client_port(&c->addr), RHD_RECV_TIMEOUT_MS);
+					remove_client(srv, i);
+				}
 			}
 		}
 
@@ -949,6 +969,29 @@ static void server_run(rhd_server_t *srv)
 		if (++jpeg_reconnect_tick >= 20) {
 			jpeg_reconnect_tick = 0;
 			for (int j = 0; j < RHD_MAX_JPEG; j++) {
+				/*
+				 * A restarted producer unlinks the name and creates a
+				 * new file, leaving this handle on an orphan whose
+				 * write_seq and incarnation are both frozen -- so
+				 * neither a read nor the idle counter below can tell
+				 * it from a ring that is merely quiet, and only the
+				 * file's identity can. Closing here falls into the
+				 * reopen below, in this same pass.
+				 */
+				if (srv->jpeg_rings[j] && rss_ring_stale(srv->jpeg_rings[j])) {
+					RSS_DEBUG("jpeg ring replaced by a new producer, "
+						  "reopening (%s)",
+						  jpeg_ring_names[j]);
+					if (ring_acquired[j]) {
+						rss_ring_release(srv->jpeg_rings[j]);
+						ring_acquired[j] = false;
+					}
+					rss_ring_close(srv->jpeg_rings[j]);
+					srv->jpeg_rings[j] = NULL;
+					jpeg_idle[j] = 0;
+					jpeg_last_ws[j] = 0;
+				}
+
 				if (!srv->jpeg_rings[j]) {
 					if (jpeg_ring_open_slot(srv, j) && ring_wanted[j]) {
 						rss_ring_acquire(srv->jpeg_rings[j]);
