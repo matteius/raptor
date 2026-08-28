@@ -33,6 +33,13 @@
 #define RIC_BASELINE_SETTLE_PCT		 2
 #define RIC_BASELINE_SETTLE_EXTEND_POLLS 17
 
+/* Some ISP/sensor combinations hold a minimum-exposure EV plateau for several
+ * polls after entering DAY, then resume their climb. Stable EV alone is
+ * therefore not evidence of settled AE during this short ambiguous window.
+ * Luma proving daylight or gain proving darkness still ends the guard
+ * immediately. */
+#define RIC_DAY_AE_MIN_SETTLE_SEC 15
+
 /* ── ADC via kernel device nodes ── */
 
 /* jz_adc_aux ioctl contract: cmd 0 enables the channel, cmd 1
@@ -415,6 +422,16 @@ static void ric_baseline_settle_begin(ric_state_t *st)
 	st->settle_extend_left = RIC_BASELINE_SETTLE_EXTEND_POLLS;
 }
 
+static void ric_day_ae_settle_begin(ric_state_t *st, bool enabled, bool switched_from_night)
+{
+	st->day_ae_settling = enabled;
+	st->day_prev_ev = 0;
+	st->day_ev_agree_run = 0;
+	st->day_ae_min_polls = enabled && switched_from_night
+				       ? polls_per(st, RIC_DAY_AE_MIN_SETTLE_SEC)
+				       : 0;
+}
+
 static bool ric_baseline_value_within(uint32_t previous, uint32_t current)
 {
 	if (previous == 0 || current == 0)
@@ -447,10 +464,9 @@ void ric_trigger_rearm(ric_state_t *st)
 	st->night_count = 0;
 	st->cooldown_remaining = 3;
 	ric_baseline_settle_begin(st);
-	st->day_ae_settling =
-		st->current_mode == RIC_MODE_DAY && st->settings.trigger == RIC_TRIGGER_LUMA;
-	st->day_prev_ev = 0;
-	st->day_ev_agree_run = 0;
+	ric_day_ae_settle_begin(
+		st, st->current_mode == RIC_MODE_DAY && st->settings.trigger == RIC_TRIGGER_LUMA,
+		false);
 	st->night_gain_baseline = 0;
 	st->night_ev_baseline = 0;
 	st->night_detect_gain = 0;
@@ -474,6 +490,7 @@ void ric_set_mode(ric_state_t *st, ric_mode_t mode)
 {
 	if (mode == st->current_mode)
 		return;
+	bool switched_from_night = st->current_mode == RIC_MODE_NIGHT && mode == RIC_MODE_DAY;
 
 	ric_set_gpio(st, mode);
 	ric_set_isp_mode(mode);
@@ -491,9 +508,7 @@ void ric_set_mode(ric_state_t *st, ric_mode_t mode)
 	 * cooldown block in ric_poll_exposure). */
 	st->cooldown_remaining = 3;
 	ric_baseline_settle_begin(st);
-	st->day_ae_settling = mode == RIC_MODE_DAY;
-	st->day_prev_ev = 0;
-	st->day_ev_agree_run = 0;
+	ric_day_ae_settle_begin(st, mode == RIC_MODE_DAY, switched_from_night);
 	st->probe_recheck_polls = 0; /* re-armed when the baseline lands */
 	if (mode == RIC_MODE_DAY)
 		st->night_gain_baseline = 0;
@@ -547,12 +562,13 @@ static uint32_t json_get_uint(const cJSON *root, const char *key)
 /* Qualify a day-mode exposure before low luma is allowed to mean night.
  * Switching ISP mode restarts AE on T31 just like cold start does: the
  * first frames have minimum gain and exposure, then EV climbs until the
- * scene is usable. A fixed delay either races slow AE or stalls a real
- * dark transition, so accept the first of:
+ * scene is usable. A short minimum guard rejects false EV plateaus, while
+ * direct optical evidence can end it immediately. Accept the first of:
  *
  *  - luma already proves daylight;
  *  - gain already proves darkness;
- *  - three successive EV readings agree within 5%.
+ *  - after the ambiguity floor, three successive EV readings agree within
+ *    5%.
  *
  * Platforms without EV retain the previous behavior. */
 static bool ric_day_ae_ready(ric_state_t *st, bool have_gain, uint32_t total_gain, bool have_luma,
@@ -569,6 +585,10 @@ static bool ric_day_ae_ready(ric_state_t *st, bool have_gain, uint32_t total_gai
 
 	st->day_ev_agree_run = within ? st->day_ev_agree_run + 1 : 0;
 	st->day_prev_ev = ev;
+	if (!day_proven && !night_proven && st->day_ae_min_polls > 0) {
+		st->day_ae_min_polls--;
+		return false;
+	}
 	if (!day_proven && !night_proven && st->day_ev_agree_run < 3)
 		return false;
 

@@ -531,16 +531,19 @@ def scenario_day_switch_ae_walk(stub, watch):
 
     dm = stub.mark()
     stub.set_scene_sequence([
-        {"luma": 4, "gain": 256, "ev": 45},
-        {"luma": 5, "gain": 256, "ev": 50},
-        {"luma": 6, "gain": 257, "ev": 56},
-        {"luma": 8, "gain": 256, "ev": 63},
-        {"luma": 11, "gain": 256, "ev": 71},
-        {"luma": 14, "gain": 257, "ev": 80},
-        {"luma": 17, "gain": 256, "ev": 90},
-        {"luma": 19, "gain": 256, "ev": 101},
-        {"luma": 21, "gain": 256, "ev": 113},
-        {"luma": 30, "gain": 256, "ev": 140},
+        # Measured BackDoor failure: minimum exposure sits at the same EV
+        # long enough to satisfy the old three-sample stability rule, then
+        # resumes climbing toward a valid daylight exposure.
+        {"luma": 4, "gain": 256, "ev": 7},
+        {"luma": 5, "gain": 256, "ev": 7},
+        {"luma": 6, "gain": 257, "ev": 7},
+        {"luma": 8, "gain": 256, "ev": 7},
+        {"luma": 11, "gain": 256, "ev": 8},
+        {"luma": 14, "gain": 257, "ev": 8},
+        {"luma": 17, "gain": 256, "ev": 9},
+        {"luma": 19, "gain": 256, "ev": 10},
+        {"luma": 21, "gain": 256, "ev": 12},
+        {"luma": 30, "gain": 256, "ev": 15},
     ])
     ok = wait_for(lambda: "day AE ready" in ric.read_log(), 4)
     result(ok, "day-switch AE walk reaches a qualified reading", ric.read_log())
