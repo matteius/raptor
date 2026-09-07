@@ -16,6 +16,7 @@
 #include "rsd.h"
 #include <rss_media_clock.h>
 #include "rsd_idr_recovery.h"
+#include "rsd_timeline.h"
 
 /* Forward declarations — called by send thread, defined below */
 static void rsd_send_audio_frame(rsd_client_t *c, uint32_t codec, const uint8_t *data, uint32_t len,
@@ -655,9 +656,11 @@ void *rsd_video_reader_thread(void *arg)
 					c->waiting_keyframe = false;
 					RSS_DEBUG("client[%d] got keyframe", stream_idx);
 				}
-				/* Timestamp base = first frame actually sent */
+				/* Preserve this sample's position on the common A/V
+				 * timeline advertised by the PLAY response. */
 				if (!c->video_ts_base_set) {
-					c->video_ts_offset = rtp_ts;
+					c->video_ts_offset = rsd_timeline_offset(rtp_ts,
+						capture_mono_us, c->timeline_epoch_us, RSD_VIDEO_CLOCK);
 					c->video_ts_base_set = true;
 				}
 
@@ -967,7 +970,8 @@ void *rsd_audio_reader_thread(void *arg)
 					continue;
 
 				if (!c->audio_ts_base_set) {
-					c->audio_ts_offset = rtp_ts;
+					c->audio_ts_offset = rsd_timeline_offset(rtp_ts,
+						(int64_t)meta.timestamp, c->timeline_epoch_us, rtp_clock);
 					c->audio_ts_base_set = true;
 				}
 				uint32_t client_ts = rtp_ts - c->audio_ts_offset + c->audio_ts_rand;

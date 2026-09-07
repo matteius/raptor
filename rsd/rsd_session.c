@@ -1264,6 +1264,8 @@ void rsd_handle_rtsp_data(rsd_client_t *client, const char *data, size_t len)
 		if (client->play_pending) {
 			client->play_pending = false;
 			pthread_mutex_lock(&client->srv->clients_lock);
+			client->timeline_epoch_us = rss_timestamp_us();
+			client->audio_ts_base_set = false;
 			/* Backdate last_rtcp so the first SR fires
 			 * RSD_SR_FIRST_US after PLAY, not a full interval. */
 			int64_t sr_base =

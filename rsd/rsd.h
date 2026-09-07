@@ -93,6 +93,7 @@ typedef struct rsd_client {
 	uint64_t video_read_seq;
 	bool waiting_keyframe;
 	bool active;
+	int64_t timeline_epoch_us; /* common audio/video origin declared by RTP-Info */
 	uint32_t video_ts_offset;      /* subtracted from global RTP ts for per-client rebase */
 	uint32_t video_ts_rand;	       /* random initial offset (declared in RTP-Info rtptime) */
 	bool video_ts_base_set;	       /* true after first keyframe sets the offset */
