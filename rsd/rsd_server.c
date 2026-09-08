@@ -840,16 +840,19 @@ void rsd_server_run(rsd_server_t *srv)
 			Compy_RtpReceiver *rcv = Compy_Backchannel_get_receiver(c->backchannel);
 			if (!rcv)
 				continue;
+			/* Report generation advances the receiver's interval history.
+			 * Do not consume that history when a busy writer defers us. */
+			if (pthread_mutex_trylock(&c->write_lock) != 0)
+				continue;
 			uint8_t rr_buf[96];
 			ssize_t rr_len = Compy_RtpReceiver_write_rr(
 				rcv, RSD_BC_REPORTER_SSRC(c->session_id), rr_now, RSD_BC_CNAME,
 				rr_buf, sizeof(rr_buf));
-			if (rr_len <= 0)
+			if (rr_len <= 0) {
+				pthread_mutex_unlock(&c->write_lock);
 				continue; /* nothing received yet */
+			}
 			struct iovec rr_iov[1] = {{.iov_base = rr_buf, .iov_len = (size_t)rr_len}};
-			/* Background reports must not hold up other clients either. */
-			if (pthread_mutex_trylock(&c->write_lock) != 0)
-				continue;
 			c->bc_last_rr = rr_now;
 			rsd_tcp_send_failed(c, VCALL(c->bc_rtcp_t, transmit,
 			      (Compy_IoVecSlice)Slice99_typed_from_array(rr_iov)));
