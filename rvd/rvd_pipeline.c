@@ -370,17 +370,44 @@ static int rvd_pipeline_init_v4l2(rvd_state_t *st)
 		st->sensor_base_fps_num = (uint32_t)sensor_fps;
 		st->sensor_base_fps_den = 1;
 	}
-	if (rss_config_get_bool(st->cfg, "stream1", "enabled", true) ||
-	    rss_config_get_bool(st->cfg, "jpeg", "enabled", true) ||
+	if (rss_config_get_bool(st->cfg, "stream1", "enabled", true)) {
+		if (!st->hal_caps || st->hal_caps->single_video_channel) {
+			RSS_WARN("V4L2 backend has one video output; stream1 disabled");
+		} else {
+			rvd_stream_t *sub = &st->streams[1];
+			load_stream_config(st->cfg, "stream1", sub, 640, 360,
+					   sensor_fps, 1000000);
+			sub->fs_chn = sub->chn = 1;
+			sub->sensor_idx = 0;
+			rss_strlcpy(sub->cfg_sect, "stream1", sizeof(sub->cfg_sect));
+			if (sub->enc_cfg.codec != RSS_CODEC_H264)
+				return RSS_ERR_NOTSUP;
+			/* Until S_PARM exposes hardware decimation, both queues run
+			 * at the sensor cadence. Keep encoder/ring metadata truthful. */
+			if (sensor_fps_known && (sub->enc_cfg.fps_num != (uint32_t)sensor_fps ||
+						sub->enc_cfg.fps_den != 1)) {
+				RSS_WARN("V4L2 stream1 rate overridden by sensor rate %d/1", sensor_fps);
+				sub->fs_cfg.fps_num = sub->enc_cfg.fps_num = (uint32_t)sensor_fps;
+				sub->fs_cfg.fps_den = sub->enc_cfg.fps_den = 1;
+				if (!rss_config_get_str(st->cfg, "stream1", "gop", NULL))
+					sub->enc_cfg.gop_length = (uint32_t)sensor_fps;
+			}
+			st->stream_count = 2;
+		}
+	}
+	if (rss_config_get_bool(st->cfg, "jpeg", "enabled", true) ||
 	    rss_config_get_bool(st->cfg, "osd", "enabled", true) ||
 	    rss_config_get_bool(st->cfg, "motion", "enabled", false))
-		RSS_WARN("V4L2 backend exposes stream0 only; sub/JPEG/OSD/IVS are disabled");
+		RSS_WARN("V4L2 backend: JPEG/OSD/IVS remain disabled");
 
-	ret = rvd_stream_init(st, 0);
-	if (ret != RSS_OK)
-		return ret;
+	for (int i = 0; i < st->stream_count; ++i) {
+		ret = rvd_stream_init(st, i);
+		if (ret != RSS_OK)
+			return ret;
+	}
 	st->pipeline_ready = true;
-	RSS_INFO("pipeline ready: V4L2 %s -> OpenIMP AVC -> main ring", device);
+	RSS_INFO("pipeline ready: V4L2 %s -> OpenIMP AVC (%d video outputs)",
+		 device, st->stream_count);
 	return RSS_OK;
 }
 
