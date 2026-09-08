@@ -203,6 +203,19 @@ static void accept_client(rsd_server_t *srv)
 	 * Reads are handled by epoll with EPOLLIN. */
 	int one = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	if (rsd_socket_write_timeout(fd, RSD_TCP_WRITE_TIMEOUT_MS) != 0) {
+		RSS_WARN("cannot bound client TCP writes: %s", strerror(errno));
+		close(fd);
+		return;
+	}
+#ifdef TCP_USER_TIMEOUT
+	/* Also bound zero-window/unacknowledged data in TLS backends which
+	 * retry WANT_WRITE after the socket's per-write timeout. */
+	unsigned int user_timeout_ms = 5000;
+	if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms,
+		       sizeof(user_timeout_ms)) != 0)
+		RSS_DEBUG("TCP_USER_TIMEOUT unavailable: %s", strerror(errno));
+#endif
 
 	/* Bound the kernel backlog as well as the userspace sendq. A buffer large
 	 * enough for several access units only turns a slow link into stale video;
@@ -700,9 +713,10 @@ void rsd_server_run(rsd_server_t *srv)
 	struct epoll_event events[16];
 	int ctrl_fd = srv->ctrl ? rss_ctrl_get_fd(srv->ctrl) : -1;
 	int audio_retry_count = 0;
+	int poll_timeout = 500;
 
 	while (rss_running(srv->running)) {
-		int n = epoll_wait(srv->epoll_fd, events, 16, 500);
+		int n = epoll_wait(srv->epoll_fd, events, 16, poll_timeout);
 		for (int i = 0; i < n; i++) {
 			int fd = events[i].data.fd;
 
@@ -759,6 +773,18 @@ void rsd_server_run(rsd_server_t *srv)
 			}
 		}
 
+		/* Requests deferred behind a media writer remain in recv_buf, so
+		 * retry without requiring another EPOLLIN edge or more peer data. */
+		poll_timeout = 500;
+		for (int i = 0; i < srv->client_count; ++i) {
+			rsd_client_t *c = srv->clients[i];
+			if (c && c->request_wait_since) {
+				rsd_handle_rtsp_data(c, c->recv_buf, c->recv_len);
+				if (c->request_wait_since)
+					poll_timeout = 50;
+			}
+		}
+
 		/* Register any new UDP RTCP fds with epoll (created by SETUP) */
 		for (int i = 0; i < srv->client_count; i++) {
 			rsd_client_t *c = srv->clients[i];
@@ -811,7 +837,6 @@ void rsd_server_run(rsd_server_t *srv)
 				continue;
 			if (rr_now - c->bc_last_rr < RSD_SR_INTERVAL_US)
 				continue;
-			c->bc_last_rr = rr_now;
 			Compy_RtpReceiver *rcv = Compy_Backchannel_get_receiver(c->backchannel);
 			if (!rcv)
 				continue;
@@ -822,9 +847,12 @@ void rsd_server_run(rsd_server_t *srv)
 			if (rr_len <= 0)
 				continue; /* nothing received yet */
 			struct iovec rr_iov[1] = {{.iov_base = rr_buf, .iov_len = (size_t)rr_len}};
-			pthread_mutex_lock(&c->write_lock);
-			VCALL(c->bc_rtcp_t, transmit,
-			      (Compy_IoVecSlice)Slice99_typed_from_array(rr_iov));
+			/* Background reports must not hold up other clients either. */
+			if (pthread_mutex_trylock(&c->write_lock) != 0)
+				continue;
+			c->bc_last_rr = rr_now;
+			rsd_tcp_send_failed(c, VCALL(c->bc_rtcp_t, transmit,
+			      (Compy_IoVecSlice)Slice99_typed_from_array(rr_iov)));
 			pthread_mutex_unlock(&c->write_lock);
 		}
 

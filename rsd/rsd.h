@@ -9,6 +9,7 @@
 
 #include "rsd_backchannel.h"
 #include "rsd_sendq.h"
+#include "rsd_io.h"
 #include <rss_ipc.h>
 #include <rss_common.h>
 #include <rss_sei.h>
@@ -145,6 +146,7 @@ typedef struct rsd_client {
 	/* RTSP parse buffer */
 	char recv_buf[RSD_BUF_SIZE];
 	size_t recv_len;
+	int64_t request_wait_since; /* main-thread-only deferred RTSP lock deadline */
 
 	/* Connection tracking */
 	int64_t last_activity; /* monotonic timestamp (us) */
@@ -158,6 +160,16 @@ typedef struct rsd_client {
 	pthread_t send_tid;
 	bool send_thread_running;
 } rsd_client_t;
+
+/* Dropping a partial TCP-interleaved frame corrupts the stream framing.
+ * Close that connection; the event loop owns cleanup/join. UDP is separate. */
+static inline bool rsd_tcp_send_failed(rsd_client_t *client, int result)
+{
+	if (result >= 0 || !client->is_tcp)
+		return false;
+	shutdown(client->fd, SHUT_RDWR);
+	return true;
+}
 
 /*
  * Per-ring reader state.

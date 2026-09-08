@@ -26,6 +26,7 @@ extern SUITE(rwd_rtcp_suite);
 extern SUITE(rad_clock_suite);
 extern SUITE(media_clock_suite);
 extern SUITE(timeline_suite);
+extern SUITE(rsd_io_suite);
 extern SUITE(idr_recovery_suite);
 extern SUITE(resync_suite);
 extern SUITE(backchannel_suite);
@@ -63,6 +64,7 @@ int main(int argc, char **argv)
 	RUN_SUITE(rad_clock_suite);
 	RUN_SUITE(media_clock_suite);
 	RUN_SUITE(timeline_suite);
+	RUN_SUITE(rsd_io_suite);
 	RUN_SUITE(idr_recovery_suite);
 	RUN_SUITE(resync_suite);
 	RUN_SUITE(backchannel_suite);

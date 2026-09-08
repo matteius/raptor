@@ -1169,8 +1169,8 @@ static Compy_ControlFlow rsd_client_t_before(VSelf, Compy_Context *ctx, const Co
 static void rsd_client_t_after(VSelf, ssize_t ret, Compy_Context *ctx, const Compy_Request *req)
 {
 	VSELF(rsd_client_t);
-	(void)self;
-	(void)ret;
+	if (ret < 0)
+		shutdown(self->fd, SHUT_RDWR);
 	(void)ctx;
 	(void)req;
 }
@@ -1254,7 +1254,15 @@ void rsd_handle_rtsp_data(rsd_client_t *client, const char *data, size_t len)
 #endif
 			writer = compy_fd_writer(&client->fd);
 		Compy_Controller ctrl = DYN(rsd_client_t, Compy_Controller, client);
-		pthread_mutex_lock(&client->write_lock);
+		int lock_ret = rsd_control_trylock(&client->write_lock, client->fd,
+						 rss_timestamp_us(), &client->request_wait_since);
+		if (lock_ret != 0) {
+			if (lock_ret < 0) {
+				RSS_WARN("closing stalled client awaiting RTSP response");
+				client->recv_len = 0;
+			}
+			return;
+		}
 		compy_dispatch(writer, ctrl, &req);
 		pthread_mutex_unlock(&client->write_lock);
 

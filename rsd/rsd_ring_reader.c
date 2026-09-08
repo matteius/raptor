@@ -218,9 +218,11 @@ static void rsd_send_video_interleaved(rsd_client_t *c, const uint8_t *data, uin
 		}
 
 		pthread_mutex_lock(&c->write_lock);
-		(void)!Compy_NalTransport_send_packet(c->video.nal, Compy_RtpTimestamp_Raw(rtp_ts),
-						      nalu);
+		bool failed = rsd_tcp_send_failed(c, Compy_NalTransport_send_packet(
+			c->video.nal, Compy_RtpTimestamp_Raw(rtp_ts), nalu));
 		pthread_mutex_unlock(&c->write_lock);
+		if (failed)
+			return;
 
 		nalu_count++;
 		p = nalu_end;
@@ -241,7 +243,7 @@ static void rsd_send_video_interleaved(rsd_client_t *c, const uint8_t *data, uin
 	if (c->srv->rtcp_sr) {
 		int64_t now = rss_timestamp_us();
 		if (c->video.rtcp && now - c->video.last_rtcp > RSD_SR_INTERVAL_US) {
-			(void)!Compy_Rtcp_send_sr(c->video.rtcp);
+			rsd_tcp_send_failed(c, Compy_Rtcp_send_sr(c->video.rtcp));
 			c->video.last_rtcp = now;
 		}
 	}
@@ -708,14 +710,17 @@ static void rsd_send_jpeg_frame(rsd_client_t *c, const uint8_t *data, uint32_t l
 		return;
 
 	pthread_mutex_lock(&c->write_lock);
-	(void)!Compy_JpegTransport_send_frame(c->video.jpeg, Compy_RtpTimestamp_Raw(rtp_ts),
-					      U8Slice99_new((uint8_t *)data, len));
+	if (rsd_tcp_send_failed(c, Compy_JpegTransport_send_frame(c->video.jpeg,
+		Compy_RtpTimestamp_Raw(rtp_ts), U8Slice99_new((uint8_t *)data, len)))) {
+		pthread_mutex_unlock(&c->write_lock);
+		return;
+	}
 	Compy_RtpTransport_set_clock_reference(c->video.rtp, rtp_ts, (uint64_t)capture_us);
 
 	if (c->srv->rtcp_sr) {
 		int64_t now = rss_timestamp_us();
 		if (c->video.rtcp && now - c->video.last_rtcp > RSD_SR_INTERVAL_US) {
-			(void)!Compy_Rtcp_send_sr(c->video.rtcp);
+			rsd_tcp_send_failed(c, Compy_Rtcp_send_sr(c->video.rtcp));
 			c->video.last_rtcp = now;
 		}
 	}
@@ -753,8 +758,10 @@ static void rsd_send_audio_frame(rsd_client_t *c, uint32_t codec, const uint8_t 
 		marker = true;
 	}
 
-	(void)!Compy_RtpTransport_send_packet(c->audio.rtp, Compy_RtpTimestamp_Raw(rtp_ts), marker,
-					      payload_hdr, U8Slice99_new((uint8_t *)data, len));
+	if (rsd_tcp_send_failed(c, Compy_RtpTransport_send_packet(c->audio.rtp,
+		Compy_RtpTimestamp_Raw(rtp_ts), marker, payload_hdr,
+		U8Slice99_new((uint8_t *)data, len))))
+		return;
 
 	/* Media-clock reference for sender reports (RFC 3550 6.4.1): pair
 	 * this frame's wire timestamp with its ring capture instant, so the
@@ -766,7 +773,7 @@ static void rsd_send_audio_frame(rsd_client_t *c, uint32_t codec, const uint8_t 
 	if (c->srv->rtcp_sr) {
 		int64_t now = rss_timestamp_us();
 		if (c->audio.rtcp && now - c->audio.last_rtcp > RSD_SR_INTERVAL_US) {
-			(void)!Compy_Rtcp_send_sr(c->audio.rtcp);
+			rsd_tcp_send_failed(c, Compy_Rtcp_send_sr(c->audio.rtcp));
 			c->audio.last_rtcp = now;
 		}
 	}
