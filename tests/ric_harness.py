@@ -500,6 +500,71 @@ def scenario_startup_dark(stub, watch):
     ric.stop()
 
 
+def scenario_highlight_exposure(stub, watch):
+    """Highlight-metered daylight must survive dusk/dawn detection."""
+    conf = LUMA_CONF + "night_min_exposure_us = 32000\n"
+    stub.set_scene(luma=15, gain=256, ev=162, exposure_us=3240, valid_mask=15)
+    mm = stub.mark()
+    ric = Ric("highlight-exposure", conf)
+    if not ric.wait_running():
+        result(False, "highlight exposure: startup", ric.read_log())
+        ric.stop()
+        return
+    time.sleep(4)
+    result("night" not in stub.modes_since(mm),
+           "low-luma daylight at short shutter stays day", ric.read_log())
+    thresholds = ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "get-thresholds"})
+    result(thresholds.get("night_min_exposure_us") == 32000,
+           "shutter minimum is exposed in thresholds")
+    response = ctrl_cmd(RUN_DIR + "/ric.sock", {
+        "cmd": "set-threshold", "key": "night_min_exposure_us", "value": -1,
+    })
+    result(response.get("status") == "error",
+           "negative shutter minimum is rejected")
+    response = ctrl_cmd(RUN_DIR + "/ric.sock", {
+        "cmd": "set-threshold", "key": "night_min_exposure_us", "value": 31999,
+    })
+    shown = ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "config-show"})
+    result(response.get("status") == "ok" and shown.get("night_min_exposure_us") == 31999,
+           "shutter minimum can be changed and inspected live")
+    ctrl_cmd(RUN_DIR + "/ric.sock", {
+        "cmd": "set-threshold", "key": "night_min_exposure_us", "value": 32000,
+    })
+    stub.set_scene(luma=15, gain=256, ev=162, exposure_us=31999, valid_mask=15)
+    time.sleep(2.5)
+    result("night" not in stub.modes_since(mm),
+           "shutter immediately below minimum still holds day", ric.read_log())
+
+    stub.set_scene(luma=15, gain=20000, ev=100000, exposure_us=32000, valid_mask=15)
+    result(wait_for(lambda: "night" in stub.modes_since(mm), 4),
+           "low luma at shutter minimum still enters night", ric.read_log())
+    time.sleep(1.4)
+    mm = stub.mark()
+    stub.set_scene(luma=15, gain=256, ev=162, exposure_us=3240, valid_mask=15)
+    result(wait_for(lambda: "day" in stub.modes_since(mm), 4),
+           "gain drop returns highlight-metered dawn to day", ric.read_log())
+    time.sleep(4)
+    result("night" not in stub.modes_since(mm) and ric_status().get("state") == "day",
+           "day verification accepts low luma with short shutter", ric.read_log())
+    mm = stub.mark()
+    stub.set_scene(luma=15, gain=90000, ev=100000, exposure_us=3240, valid_mask=15)
+    result(wait_for(lambda: "night" in stub.modes_since(mm), 4),
+           "high gain remains an independent night trigger", ric.read_log())
+    ric.stop()
+
+    for label, scene in [
+        ("legacy", {"exposure_us": 0}),
+        ("invalid", {"exposure_us": 3240, "valid_mask": 13}),
+        ("zero", {"exposure_us": 0, "valid_mask": 15}),
+    ]:
+        stub.set_scene(luma=15, gain=256, ev=162, **scene)
+        mm = stub.mark()
+        ric = Ric("highlight-" + label, conf)
+        result(ric.wait_running() and wait_for(lambda: "night" in stub.modes_since(mm), 4),
+               label + " shutter keeps low-luma fallback", ric.read_log())
+        ric.stop()
+
+
 def scenario_day_switch_ae_walk(stub, watch):
     """Entering day mode restarts AE. Rising EV after a valid dawn decision
     must not fail post-switch verification or debounce straight back to night."""
@@ -2588,6 +2653,7 @@ def main():
         scenario_startup_park,
         scenario_startup_ae_walk,
         scenario_startup_dark,
+        scenario_highlight_exposure,
         scenario_day_switch_ae_walk,
         scenario_dusk_dawn,
         scenario_hysteresis,

@@ -142,7 +142,8 @@ typedef struct {
 	ric_trigger_t trigger;
 
 	/* Luma trigger thresholds */
-	int night_luma;	       /* ae_luma below this → night (default 20, 0-255) */
+	int night_luma; /* ae_luma below this → night (default 20, 0-255) */
+	int night_min_exposure_us; /* minimum shutter for low-luma night detection (0=off) */
 	int night_gain;	       /* gain above this → night regardless of luma (default 80000) */
 	int day_gain_pct;      /* night→day: gain below this % of baseline → day (default 25) */
 	int probe_gain_pct;    /* night: gain dip below this % of baseline lifts the IR

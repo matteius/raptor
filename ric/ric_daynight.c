@@ -618,7 +618,7 @@ void ric_poll_exposure(ric_state_t *st)
 	if (st->settings.opmode != RIC_AUTO)
 		return;
 
-	uint32_t total_gain = 0, ae_luma = 0;
+	uint32_t total_gain = 0, ae_luma = 0, exposure_us = 0;
 	uint32_t ev = 0;
 	uint32_t valid_mask = 0;
 	bool has_valid_mask = false;
@@ -630,6 +630,7 @@ void ric_poll_exposure(ric_state_t *st)
 	}
 	total_gain = json_get_uint(parsed, "total_gain");
 	ae_luma = json_get_uint(parsed, "ae_luma");
+	exposure_us = json_get_uint(parsed, "exposure_us");
 	ev = json_get_uint(parsed, "ev");
 	const cJSON *valid_item = cJSON_GetObjectItem(parsed, "valid_mask");
 	if (cJSON_IsNumber(valid_item)) {
@@ -655,6 +656,16 @@ void ric_poll_exposure(ric_state_t *st)
 	bool have_luma =
 		has_valid_mask ? (valid_mask & RSS_EXPOSURE_VALID_AE_LUMA) != 0 : ae_luma > 0;
 	bool have_ev = has_valid_mask ? (valid_mask & RSS_EXPOSURE_VALID_EV) != 0 : ev > 0;
+	bool have_exposure = exposure_us > 0 &&
+			     (!has_valid_mask || (valid_mask & RSS_EXPOSURE_VALID_TIME) != 0);
+	/* Highlight metering can deliberately hold luma below the night threshold
+	 * in daylight. Require shutter headroom to be used before calling that
+	 * darkness. Zero disables the gate; old HALs without shutter readback
+	 * retain the luma fallback. High gain remains an independent night signal.
+	 * Use the same test after dawn so a valid day switch is not rejected. */
+	bool luma_dark = have_luma && ae_luma < (uint32_t)st->settings.night_luma &&
+			 (st->settings.night_min_exposure_us == 0 || !have_exposure ||
+			  exposure_us >= (uint32_t)st->settings.night_min_exposure_us);
 
 	if (st->settings.trigger != RIC_TRIGGER_ADC && !have_gain && !have_luma && !have_ev) {
 		if (!st->no_exposure_warned) {
@@ -701,7 +712,7 @@ void ric_poll_exposure(ric_state_t *st)
 				return;
 			}
 			st->day_verify_pending = false;
-			if (have_luma && ae_luma < (uint32_t)st->settings.night_luma) {
+			if (luma_dark) {
 				/* The scene reads night-dark with the IR off: the
 				 * "day" was the LED's own light bouncing back (a
 				 * covered lens, a point-blank surface). Revert and
@@ -789,9 +800,10 @@ void ric_poll_exposure(ric_state_t *st)
 		/*
 		 * Hybrid luma+gain algorithm (sensor-independent):
 		 *
-		 * Day → Night: ae_luma < night_luma.
-		 *   No IR LEDs on in day mode, so ae_luma directly reflects
-		 *   ambient light. Works identically across all sensors.
+		 * Day → Night: low luma, optionally qualified by shutter time.
+		 *   The minimum shutter distinguishes darkness from deliberate
+		 *   underexposure by highlight metering. Gain above night_gain
+		 *   is an independent fallback even below the shutter minimum.
 		 *
 		 * Night → Day: total_gain < day_gain_pct% of night baseline.
 		 *   When ambient light returns (dawn, lights on), the ISP
@@ -804,7 +816,7 @@ void ric_poll_exposure(ric_state_t *st)
 		 * Each term is gated on its field being reported, so a
 		 * platform missing one runs on the other alone.
 		 */
-		want_night = (have_luma && ae_luma < (uint32_t)st->settings.night_luma) ||
+		want_night = luma_dark ||
 			     (have_gain && total_gain > (uint32_t)st->settings.night_gain);
 
 		/* Luma is trustworthy for the day direction only while no
@@ -949,8 +961,10 @@ void ric_poll_exposure(ric_state_t *st)
 			want_day = false;
 		}
 
-		snprintf(why, sizeof(why), "luma=%u/%d gain=%u/%d night baseline=%u x %d%%%s",
-			 ae_luma, st->settings.night_luma, total_gain, st->settings.night_gain,
+		snprintf(why, sizeof(why),
+			 "luma=%u/%d shutter=%u/%dus gain=%u/%d night baseline=%u x %d%%%s",
+			 ae_luma, st->settings.night_luma, exposure_us,
+			 st->settings.night_min_exposure_us, total_gain, st->settings.night_gain,
 			 st->night_gain_baseline, st->settings.day_gain_pct,
 			 st->probe_active ? " (probing)" : "");
 	} else if (st->settings.trigger == RIC_TRIGGER_ADC) {

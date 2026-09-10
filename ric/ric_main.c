@@ -85,6 +85,9 @@ static void load_config(ric_state_t *st)
 	/* Luma trigger thresholds */
 	c->night_luma =
 		cfg_clamp("night_luma", rss_config_get_int(cfg, "ircut", "night_luma", 20), 0, 255);
+	c->night_min_exposure_us = cfg_clamp(
+		"night_min_exposure_us",
+		rss_config_get_int(cfg, "ircut", "night_min_exposure_us", 0), 0, INT_MAX);
 	c->night_gain = cfg_clamp(
 		"night_gain", rss_config_get_int(cfg, "ircut", "night_gain", 80000), 0, INT_MAX);
 	c->day_gain_pct = cfg_clamp("day_gain_pct",
@@ -290,6 +293,11 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 				return rss_ctrl_resp_error(resp_buf, resp_buf_size, "range 0-255");
 			c->night_luma = val;
 			cfg_key = "night_luma";
+		} else if (strcmp(key, "night_min_exposure_us") == 0) {
+			if (val < 0)
+				return rss_ctrl_resp_error(resp_buf, resp_buf_size, "must be >= 0");
+			c->night_min_exposure_us = val;
+			cfg_key = "night_min_exposure_us";
 		} else if (strcmp(key, "night_gain") == 0) {
 			if (val < 0)
 				return rss_ctrl_resp_error(resp_buf, resp_buf_size, "must be >= 0");
@@ -508,6 +516,7 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 					: c->trigger == RIC_TRIGGER_ADC	 ? "adc"
 									 : "photo");
 		cJSON_AddNumberToObject(r, "night_luma", c->night_luma);
+		cJSON_AddNumberToObject(r, "night_min_exposure_us", c->night_min_exposure_us);
 		cJSON_AddNumberToObject(r, "night_gain", c->night_gain);
 		cJSON_AddNumberToObject(r, "day_gain_pct", c->day_gain_pct);
 		cJSON_AddNumberToObject(r, "night_threshold", c->night_threshold);
@@ -549,6 +558,8 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 		if (sub)
 			cJSON_AddItemToObject(r, "exposure", sub);
 		cJSON_AddNumberToObject(r, "night_luma", st->settings.night_luma);
+		cJSON_AddNumberToObject(r, "night_min_exposure_us",
+				       st->settings.night_min_exposure_us);
 		cJSON_AddNumberToObject(r, "night_gain", st->settings.night_gain);
 		cJSON_AddNumberToObject(r, "day_gain_pct", st->settings.day_gain_pct);
 		cJSON_AddNumberToObject(r, "night_threshold", st->settings.night_threshold);
@@ -693,8 +704,10 @@ int main(int argc, char **argv)
 			  st.settings.photo.ev_day, st.settings.photo.rgain_rec,
 			  st.settings.photo.bgain_rec);
 	} else if (st.settings.trigger == RIC_TRIGGER_LUMA) {
-		RSS_DEBUG("  luma: night_luma=%d night_gain=%d day_gain_pct=%d",
-			  st.settings.night_luma, st.settings.night_gain, st.settings.day_gain_pct);
+		RSS_DEBUG("  luma: night_luma=%d night_min_exposure_us=%d "
+			  "night_gain=%d day_gain_pct=%d",
+			  st.settings.night_luma, st.settings.night_min_exposure_us,
+			  st.settings.night_gain, st.settings.day_gain_pct);
 	} else {
 		RSS_DEBUG("  gain: night=%d day=%d", st.settings.night_threshold,
 			  st.settings.day_threshold);
