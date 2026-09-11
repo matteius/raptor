@@ -643,6 +643,103 @@ def scenario_highlight_night(stub, watch):
         ric.stop()
 
 
+
+def scenario_highlight_dawn_probe(stub, watch):
+    """BackDoor remained night at luma 25/30, 100 us, gain 275 and EV 5."""
+    conf = LUMA_CONF + "night_luma = 30\nnight_min_exposure_us = 32000\n"
+    # Repeated failed probes can leave both gain and EV at their floors.
+    # Test an EV dip and recovery when there is no further dip available.
+    for label, baseline in [("dip", 32000), ("floor", 100)]:
+        stub.set_scene(luma=25, gain=275, ev=1720 if baseline == 32000 else 5,
+                       exposure_us=baseline, valid_mask=15)
+        ric = Ric("highlight-dawn-" + label, conf, mode="night")
+        try:
+            if not ric.wait_running():
+                result(False, "highlight dawn " + label + ": startup", ric.read_log())
+                continue
+            gm, mm = watch.mark(), stub.mark()
+            ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "mode", "value": "auto"})
+            if baseline == 32000:
+                time.sleep(1.4)
+                stub.set_scene(luma=25, gain=275, ev=5, exposure_us=100, valid_mask=15)
+            off = wait_for(lambda: last_value(watch.since(gm), IRLED) == "0", 5)
+            result(off, "highlight dawn " + label + ": IR-off probe starts", ric.read_log())
+            result("day" not in stub.modes_since(mm),
+                   "highlight dawn " + label + ": IR light cannot prove day")
+            result(wait_for(lambda: "day" in stub.modes_since(mm), 4),
+                   "highlight dawn " + label + ": short ambient exposure proves day",
+                   ric.read_log())
+            time.sleep(4)
+            result(ric_status().get("state") == "day" and
+                   last_value(watch.since(gm), IRLED) == "0",
+                   "highlight dawn " + label + ": day holds with IR off", ric.read_log())
+        finally:
+            ric.stop()
+
+
+def scenario_highlight_dawn_guards(stub, watch):
+    conf = LUMA_CONF + "night_luma = 30\nnight_min_exposure_us = 32000\n"
+    # A short IR-lit exposure is only a reason to test ambient light.
+    stub.set_scene(luma=25, gain=275, ev=5, exposure_us=100, valid_mask=15)
+    ric = Ric("highlight-dawn-reflection", conf, mode="night")
+    try:
+        result(ric.wait_running(), "highlight dawn reflection: startup")
+        gm, mm = watch.mark(), stub.mark()
+        ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "mode", "value": "auto"})
+        off = wait_for(lambda: last_value(watch.since(gm), IRLED) == "0", 5)
+        result(off, "highlight dawn reflection: probe lifts IR")
+        # The actual dark scene appears before the settling window expires.
+        stub.set_scene(luma=5, gain=5000, ev=31250, exposure_us=32000, valid_mask=15)
+        result(wait_for(lambda: last_value(watch.since(gm), IRLED) == "1", 4),
+               "highlight dawn reflection: dark ambient restores IR", ric.read_log())
+        gm = watch.mark()
+        stub.set_scene(luma=25, gain=275, ev=5, exposure_us=100, valid_mask=15)
+        time.sleep(2)
+        result(ric_status().get("state") == "night" and
+               "day" not in stub.modes_since(mm),
+               "highlight dawn reflection: stays night", ric.read_log())
+        result(last_value(watch.since(gm), IRLED) != "0",
+               "highlight dawn reflection: holdoff prevents repeated blinking")
+    finally:
+        ric.stop()
+
+    for label, scene, extra in [
+        ("zero-time", {"exposure_us": 0}, ""),
+        ("invalid-time", {"valid_mask": 13}, ""),
+        ("invalid-gain", {"valid_mask": 14}, ""),
+        ("invalid-luma", {"valid_mask": 11}, ""),
+        ("long-time", {"exposure_us": 32000}, ""),
+        ("high-gain", {"gain": 90000}, ""),
+        ("disabled-gate", {}, "night_min_exposure_us = 0\n"),
+        ("disabled-probes", {}, "probe_gain_pct = 0\n"),
+    ]:
+        sample = dict(luma=25, gain=275, ev=5, exposure_us=100, valid_mask=15)
+        sample.update(scene)
+        stub.set_scene(**sample)
+        ric = Ric("highlight-dawn-" + label, conf + extra, mode="night")
+        try:
+            running = ric.wait_running()
+            gm = watch.mark()
+            ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "mode", "value": "auto"})
+            time.sleep(2.5)
+            result(running and ric_status().get("state") == "night" and
+                   last_value(watch.since(gm), IRLED) != "0",
+                   "highlight dawn: " + label + " cannot arm shutter probe", ric.read_log())
+        finally:
+            ric.stop()
+
+    stub.set_scene(luma=25, gain=275, ev=5, exposure_us=100, valid_mask=15)
+    ric = Ric("highlight-dawn-noir", conf + "ir850 = false\nir940 = false\n", mode="night")
+    try:
+        result(ric.wait_running(), "highlight dawn no-IR: startup")
+        mm = stub.mark()
+        ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "mode", "value": "auto"})
+        result(wait_for(lambda: "day" in stub.modes_since(mm), 5),
+               "highlight dawn no-IR: short ambient exposure proves day", ric.read_log())
+    finally:
+        ric.stop()
+
+
 def scenario_day_switch_ae_walk(stub, watch):
     """Entering day mode restarts AE. Rising EV after a valid dawn decision
     must not fail post-switch verification or debounce straight back to night."""
@@ -2733,6 +2830,8 @@ def main():
         scenario_startup_dark,
         scenario_highlight_exposure,
         scenario_highlight_night,
+        scenario_highlight_dawn_probe,
+        scenario_highlight_dawn_guards,
         scenario_day_switch_ae_walk,
         scenario_dusk_dawn,
         scenario_hysteresis,

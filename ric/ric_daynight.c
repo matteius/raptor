@@ -686,6 +686,13 @@ void ric_poll_exposure(ric_state_t *st)
 	bool luma_dark = have_luma && ae_luma < (uint32_t)st->settings.night_luma &&
 			 (st->settings.night_min_exposure_us == 0 || !have_exposure ||
 			  exposure_us >= (uint32_t)st->settings.night_min_exposure_us);
+	/* Below this opt-in shutter limit, valid nonzero gain that does not
+	 * indicate darkness can explain low luma as highlight metering. With IR
+	 * on this is only a probe hint; it proves day only with the LEDs off. */
+	bool short_day = st->settings.night_min_exposure_us > 0 && have_exposure &&
+			 exposure_us < (uint32_t)st->settings.night_min_exposure_us &&
+			 have_luma && have_gain && total_gain > 0 &&
+			 total_gain <= (uint32_t)st->settings.night_gain;
 
 	if (st->settings.trigger != RIC_TRIGGER_ADC && !have_gain && !have_luma && !have_ev) {
 		if (!st->no_exposure_warned) {
@@ -867,7 +874,8 @@ void ric_poll_exposure(ric_state_t *st)
 				st->night_gain_baseline * (uint32_t)st->settings.day_gain_pct / 100;
 			want_day = (total_gain < day_thr);
 		}
-		if (!ir_lit && have_luma && ae_luma >= (uint32_t)st->settings.night_luma)
+		if (!ir_lit && ((have_luma && ae_luma >= (uint32_t)st->settings.night_luma) ||
+			       short_day))
 			want_day = true;
 
 		/* IR-off ambient probe: compressed-gain sensors (T20 class)
@@ -875,8 +883,9 @@ void ric_poll_exposure(ric_state_t *st)
 		 * fire -- measured on a Wyze V2: night baseline 1299 with
 		 * IR, lights-on 1024, ratio floor 324. The dip below the
 		 * baseline is still a reliable brightness hint, so lift the
-		 * LEDs and let the now-trustworthy luma decide. A truly
-		 * dark night sits at its baseline and never probes; a probe
+		 * LEDs and let ambient luma or a qualified short shutter decide.
+		 * The shutter hint also recovers at the gain/EV floor, where
+		 * no further dip is possible after earlier failed probes. A probe
 		 * that finds darkness restores the LEDs and backs off. */
 		if (st->probe_active && st->current_mode != RIC_MODE_NIGHT) {
 			/* The probe ended in a day switch; LEDs already match
@@ -917,11 +926,12 @@ void ric_poll_exposure(ric_state_t *st)
 				}
 				if (st->probe_holdoff_polls > 0 && !recheck_due) {
 					st->probe_holdoff_polls--;
-				} else if (!recheck_due && (!dip_have || dip_val >= dip_thr)) {
-					/* Not dipping (or no reading): the run
-					 * must not accumulate across gaps. */
+				} else if (!recheck_due && !short_day &&
+					   (!dip_have || dip_val >= dip_thr)) {
+					/* No dip or shutter hint: the run must
+					 * not accumulate across gaps. */
 					st->probe_dip_run = 0;
-				} else if (/* The dip must persist: a single low
+				} else if (/* The hint must persist: a single low
 					    * poll can be an AE transient. The
 					    * interval recheck fires outright. */
 					   recheck_due || ++st->probe_dip_run >= 3) {
@@ -940,6 +950,10 @@ void ric_poll_exposure(ric_state_t *st)
 						RSS_INFO("interval recheck after %ds of quiet "
 							 "night: IR off for an ambient probe",
 							 st->settings.probe_recheck_sec);
+					else if (short_day)
+						RSS_INFO("short shutter %uus below %dus: IR off "
+							 "for an ambient probe", exposure_us,
+							 st->settings.night_min_exposure_us);
 					else
 						RSS_INFO("%s %u dipped under %d%% of night "
 							 "baseline %u: IR off for an ambient "
