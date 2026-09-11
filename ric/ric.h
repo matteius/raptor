@@ -144,6 +144,7 @@ typedef struct {
 	/* Luma trigger thresholds */
 	int night_luma; /* ae_luma below this → night (default 20, 0-255) */
 	int night_min_exposure_us; /* minimum shutter for low-luma night detection (0=off) */
+	int night_highlight_depress; /* -1: preserve image setting, 0-255: night override */
 	int night_gain;	       /* gain above this → night regardless of luma (default 80000) */
 	int day_gain_pct;      /* night→day: gain below this % of baseline → day (default 25) */
 	int probe_gain_pct;    /* night: gain dip below this % of baseline lifts the IR
@@ -275,7 +276,7 @@ void ric_gpio_init(ric_state_t *st);
 void ric_set_mode(ric_state_t *st, ric_mode_t mode);
 void ric_trigger_rearm(ric_state_t *st);
 void ric_force_mode(ric_state_t *st, ric_mode_t mode);
-void ric_set_isp_mode(ric_mode_t mode);
+void ric_set_isp_mode(ric_state_t *st, ric_mode_t mode);
 void ric_apply_night_fps(ric_state_t *st, ric_mode_t mode);
 int ric_ircut_drive(ric_state_t *st, ric_mode_t pos);
 int ric_irled_drive(ric_state_t *st, bool bank940, bool on);

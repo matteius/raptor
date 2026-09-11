@@ -82,6 +82,11 @@ static void load_config(ric_state_t *st)
 	else
 		c->trigger = RIC_TRIGGER_LUMA;
 
+	/* Optional night metering override; daytime remains in [image]. */
+	c->night_highlight_depress = cfg_clamp(
+		"night_highlight_depress",
+		rss_config_get_int(cfg, "ircut", "night_highlight_depress", -1), -1, 255);
+
 	/* Luma trigger thresholds */
 	c->night_luma =
 		cfg_clamp("night_luma", rss_config_get_int(cfg, "ircut", "night_luma", 20), 0, 255);
@@ -177,12 +182,12 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 		return rss_ctrl_resp_error(resp_buf, resp_buf_size, "missing cmd");
 
 	if (strcmp(cmd, "isp-mode") == 0) {
-		/* ISP running mode only — no GPIO/IR-cut toggling */
+		/* ISP mode and metering policy, without GPIO/IR-cut toggling. */
 		char val[16];
 		const char *isp_state = "day";
 		if (rss_json_get_str(cmd_json, "value", val, sizeof(val)) == 0) {
 			ric_mode_t m = strcmp(val, "night") == 0 ? RIC_MODE_NIGHT : RIC_MODE_DAY;
-			ric_set_isp_mode(m);
+			ric_set_isp_mode(st, m);
 			isp_state = val;
 			RSS_INFO("ISP mode set to %s (GPIO unchanged)", val);
 		}
@@ -560,6 +565,8 @@ static int ric_ctrl_handler(const char *cmd_json, char *resp_buf, int resp_buf_s
 		cJSON_AddNumberToObject(r, "night_luma", st->settings.night_luma);
 		cJSON_AddNumberToObject(r, "night_min_exposure_us",
 				       st->settings.night_min_exposure_us);
+		cJSON_AddNumberToObject(r, "night_highlight_depress",
+				       st->settings.night_highlight_depress);
 		cJSON_AddNumberToObject(r, "night_gain", st->settings.night_gain);
 		cJSON_AddNumberToObject(r, "day_gain_pct", st->settings.day_gain_pct);
 		cJSON_AddNumberToObject(r, "night_threshold", st->settings.night_threshold);

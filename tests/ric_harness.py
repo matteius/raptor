@@ -147,6 +147,8 @@ class StubRvd:
         self.modes = []  # (monotonic, "day"|"night")
         self.fps_calls = []  # (monotonic, int value) from set-sensor-fps
         self.fps_error = False  # answer set-sensor-fps with an error
+        self.isp_calls = []  # ordered mode/highlight operations
+        self.highlight_error = False
         self.lock = threading.Lock()
         self.path = RUN_DIR + "/rvd.sock"
         self._bind()
@@ -230,7 +232,14 @@ class StubRvd:
                     val = json.loads(req).get("value", "?")
                     with self.lock:
                         self.modes.append((time.monotonic(), val))
+                        self.isp_calls.append(("mode", val))
                     resp = {"status": "ok", "mode": val}
+                elif cmd == "set-highlight-depress":
+                    val = json.loads(req).get("value", -1)
+                    with self.lock:
+                        self.isp_calls.append(("highlight", val))
+                        err = self.highlight_error
+                    resp = {"status": "error" if err else "ok"}
                 elif cmd == "set-sensor-fps":
                     val = json.loads(req).get("value", -1)
                     with self.lock:
@@ -562,6 +571,75 @@ def scenario_highlight_exposure(stub, watch):
         ric = Ric("highlight-" + label, conf)
         result(ric.wait_running() and wait_for(lambda: "night" in stub.modes_since(mm), 4),
                label + " shutter keeps low-luma fallback", ric.read_log())
+        ric.stop()
+
+
+
+def scenario_highlight_night(stub, watch):
+    """Daylight sky metering must not follow an IR reflection into night."""
+    conf = (LUMA_CONF + "night_min_exposure_us = 32000\n"
+            "night_highlight_depress = 1\n[image]\nhighlight_depress = 8\n")
+    stub.set_scene(luma=15, gain=256, ev=162, exposure_us=3240, valid_mask=15)
+    with stub.lock:
+        start = len(stub.isp_calls)
+    ric = Ric("highlight-night", conf)
+    try:
+        result(ric.wait_running(), "night highlight: startup", ric.read_log())
+        result(wait_for(lambda: ("highlight", 8) in stub.isp_calls[start:], 3),
+               "night highlight: startup restores daytime strength")
+        shown = ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "config-show"})
+        result(shown.get("night_highlight_depress") == 1,
+               "night highlight: configuration is inspectable")
+        stub.set_scene(luma=11, gain=7000, ev=43000, exposure_us=32000, valid_mask=15)
+        result(wait_for(lambda: ("highlight", 1) in stub.isp_calls[start:], 5),
+               "night highlight: dusk lowers highlight strength", ric.read_log())
+        with stub.lock:
+            calls = list(stub.isp_calls[start:])
+        idx = calls.index(("highlight", 1)) if ("highlight", 1) in calls else 0
+        result(idx > 0 and calls[idx - 1] == ("mode", "night"),
+               "night highlight: override follows calibration-bank switch", str(calls))
+        # A restarted video daemon loses its tuning; the first good poll must
+        # restore both night mode and its highlight level.
+        with stub.lock:
+            restart = len(stub.isp_calls)
+        stub.pause()
+        time.sleep(0.8)
+        stub.resume()
+        result(wait_for(lambda: ("highlight", 1) in stub.isp_calls[restart:], 4),
+               "night highlight: reapplied after video-daemon recovery", ric.read_log())
+        time.sleep(1.4)
+        with stub.lock:
+            dawn = len(stub.isp_calls)
+        stub.set_scene(luma=15, gain=256, ev=162, exposure_us=3240, valid_mask=15)
+        result(wait_for(lambda: ("highlight", 8) in stub.isp_calls[dawn:], 6),
+               "night highlight: dawn restores original sky correction", ric.read_log())
+        stub.highlight_error = True
+        ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "isp-mode", "value": "night"})
+        result("night highlight setting 1 not applied" in ric.read_log(),
+               "night highlight: backend rejection is reported", ric.read_log())
+    finally:
+        stub.highlight_error = False
+        ric.stop()
+
+    with stub.lock:
+        start = len(stub.isp_calls)
+    ric = Ric("highlight-default", LUMA_CONF, mode="night")
+    try:
+        result(ric.wait_running(), "night highlight: disabled startup")
+        ctrl_cmd(RUN_DIR + "/ric.sock", {"cmd": "isp-mode", "value": "day"})
+        result(not any(k == "highlight" for k, _ in stub.isp_calls[start:]),
+               "night highlight: existing configurations leave metering alone")
+    finally:
+        ric.stop()
+
+    with stub.lock:
+        start = len(stub.isp_calls)
+    ric = Ric("highlight-forced-night", conf, mode="night")
+    try:
+        result(ric.wait_running() and wait_for(
+            lambda: ("highlight", 1) in stub.isp_calls[start:], 3),
+            "night highlight: forced-night boot applies override", ric.read_log())
+    finally:
         ric.stop()
 
 
@@ -2654,6 +2732,7 @@ def main():
         scenario_startup_ae_walk,
         scenario_startup_dark,
         scenario_highlight_exposure,
+        scenario_highlight_night,
         scenario_day_switch_ae_walk,
         scenario_dusk_dawn,
         scenario_hysteresis,

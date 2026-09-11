@@ -180,7 +180,7 @@ static void rvd_note_good_query(ric_state_t *st)
 		 * every recovery; the call is idempotent and recoveries
 		 * are rare. The night sensor rate rides along for the same
 		 * reason: a restarted rvd is back at its boot rate. */
-		ric_set_isp_mode(st->current_mode);
+		ric_set_isp_mode(st, st->current_mode);
 		ric_apply_night_fps(st, st->current_mode);
 	}
 	st->rvd_fail_run = 0;
@@ -262,10 +262,10 @@ void ric_gpio_init(ric_state_t *st)
 }
 
 /*
- * Set ISP running mode only (day/night) via RVD control socket.
+ * Set ISP running mode and optional metering policy via RVD control socket.
  * Does not toggle GPIO/IR-cut hardware.
  */
-void ric_set_isp_mode(ric_mode_t mode)
+void ric_set_isp_mode(ric_state_t *st, ric_mode_t mode)
 {
 	char resp[128];
 	int ret = rss_ctrl_cmd_str(RSS_RUN_DIR "/rvd.sock", "set-running-mode", "value",
@@ -274,10 +274,30 @@ void ric_set_isp_mode(ric_mode_t mode)
 	/* The filter and LEDs have already moved; a failure here is a
 	 * half-finished transition (color at night or B/W in day) that
 	 * otherwise heals only at the next switch. */
-	if (ret < 0)
-		RSS_WARN("ISP %s mode not applied (rvd unreachable) -- image stays in the old "
-			 "mode until the next transition",
+	if (ret < 0 || !rss_ctrl_resp_is_ok(resp)) {
+		RSS_WARN("ISP %s mode not applied -- retried on recovery or transition",
 			 mode == RIC_MODE_NIGHT ? "night" : "day");
+		return;
+	}
+	if (st->settings.night_highlight_depress < 0)
+		return;
+
+	/* Apply after the ISP changes calibration banks. A bright IR reflection
+	 * can dominate highlight metering at night even when the yard is dark.
+	 * Restore the configured daytime strength at dawn and after rvd recovery.
+	 * The runtime setter does not overwrite [image] highlight_depress. */
+	int value = st->settings.night_highlight_depress;
+	if (mode != RIC_MODE_NIGHT)
+		value = rss_config_get_int(st->cfg, "image", "highlight_depress", 0);
+	if (value < 0)
+		value = 0;
+	else if (value > 255)
+		value = 255;
+	ret = rss_ctrl_cmd_int(RSS_RUN_DIR "/rvd.sock", "set-highlight-depress", "value",
+			       value, resp, sizeof(resp), 2000);
+	if (ret < 0 || !rss_ctrl_resp_is_ok(resp))
+		RSS_WARN("%s highlight setting %d not applied -- retried on recovery or transition",
+			 mode == RIC_MODE_NIGHT ? "night" : "day", value);
 }
 
 /*
@@ -407,7 +427,7 @@ void ric_force_mode(ric_state_t *st, ric_mode_t mode)
 {
 	if (mode == st->current_mode) {
 		ric_set_gpio(st, mode);
-		ric_set_isp_mode(mode);
+		ric_set_isp_mode(st, mode);
 		ric_apply_night_fps(st, mode);
 		return;
 	}
@@ -493,7 +513,7 @@ void ric_set_mode(ric_state_t *st, ric_mode_t mode)
 	bool switched_from_night = st->current_mode == RIC_MODE_NIGHT && mode == RIC_MODE_DAY;
 
 	ric_set_gpio(st, mode);
-	ric_set_isp_mode(mode);
+	ric_set_isp_mode(st, mode);
 	ric_apply_night_fps(st, mode);
 	RSS_INFO("switched to %s mode", mode == RIC_MODE_NIGHT ? "NIGHT" : "DAY");
 
